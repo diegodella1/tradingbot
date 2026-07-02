@@ -11,6 +11,7 @@ bot.sqlite3-*
 *.sqlite3-*
 *.paper.lock
 *.log
+probability_model.json
 
 .agents/
 .codex/

@@ -6,9 +6,20 @@ from datetime import UTC, datetime
 
 import typer
 
+from bot.backtest import (
+    bucket_breakdown,
+    build_training_rows,
+    load_samples,
+    recommend,
+    recommended_env_lines,
+    run_backtest,
+    run_sweep,
+)
 from bot.config import Settings, get_settings
 from bot.knowledge.rag import index_markdown, search
+from bot.strategy.calibration import ProbabilityModel, accuracy, fit_logistic, log_loss, walk_forward
 from bot.learning.policy import generate_learning_report, persist_learning_recommendations
+from bot.live_loop import run_live_loop
 from bot.main import configure_logging, run_paper_loop
 from bot.monitoring.health import local_health
 from bot.polymarket.clob import ClobClient
@@ -72,6 +83,129 @@ def paper(max_cycles: int | None = typer.Option(None, help="Stop after N cycles;
     except RuntimeError as exc:
         typer.echo(str(exc))
         raise typer.Exit(1) from exc
+
+
+@app.command()
+def backtest(
+    size: float = typer.Option(1.0, min=0.0, help="Per-signal stake in USDC used to scale PnL."),
+    buckets: bool = typer.Option(False, "--buckets", help="Show WR/PnL breakdown by price, time, market type and probability."),
+    sweep: bool = typer.Option(False, "--sweep", help="Grid-search entry gates using the calibrated model."),
+    target_wr: float = typer.Option(0.70, min=0.0, max=1.0, help="Minimum win rate for the sweep recommendation."),
+) -> None:
+    """Backtest recorded strategy signals against verified market outcomes (hold-to-resolution)."""
+    settings = _settings()
+    with connect(settings.sqlite_path) as conn:
+        report = run_backtest(conn, settings, size_usdc=size)
+        samples = load_samples(conn) if buckets else []
+        training_rows = build_training_rows(conn) if sweep else []
+
+    typer.echo("backtest (recorded signals vs verified outcomes)")
+    typer.echo(f"- signals={report['sample_count']} resolved={report['resolved_count']} stake_usdc={report['size_usdc']:.2f}")
+    for scope in ("all", "5m", "15m"):
+        stats = report["summary"].get(scope)
+        if not stats:
+            continue
+        typer.echo(
+            f"- {scope}: signals={stats['signals']} resolved={stats['resolved']} "
+            f"win_rate={_fmt_pct(stats['win_rate'])} pnl_usdc={stats['pnl_usdc']:.2f} "
+            f"roi={_fmt_pct(stats['roi'])} avg_edge_cents={_fmt_num(stats['avg_edge_cents'])} "
+            f"avg_conf={_fmt_num(stats['avg_confidence'])}"
+        )
+    typer.echo("- calibration (predicted -> actual win rate):")
+    for bucket in report["calibration"]:
+        if bucket["count"] == 0:
+            continue
+        typer.echo(
+            f"  [{bucket['bin_low']:.1f},{bucket['bin_high']:.1f}) n={bucket['count']} "
+            f"predicted={_fmt_num(bucket['predicted'])} actual={_fmt_num(bucket['actual'])}"
+        )
+    if buckets:
+        _print_buckets(samples, settings, size)
+    if sweep:
+        _print_sweep(training_rows, settings, target_wr)
+
+
+def _print_buckets(samples, settings: Settings, size: float) -> None:
+    breakdown = bucket_breakdown(samples, settings, size_usdc=size)
+    labels = {
+        "entry_price": "precio de entrada",
+        "seconds_to_close": "segundos al cierre",
+        "market_type": "tipo de mercado",
+        "estimated_probability": "prob estimada",
+    }
+    for key, label in labels.items():
+        typer.echo(f"- WR por {label}:")
+        for row in breakdown[key]:
+            typer.echo(f"  {row['bucket']}: n={row['n']} WR={_fmt_pct(row['win_rate'])} pnl={row['pnl_usdc']:+.2f}")
+
+
+def _print_sweep(training_rows, settings: Settings, target_wr: float) -> None:
+    model = ProbabilityModel.load(settings.probability_model_path)
+    if model is None or not model.is_compatible():
+        typer.echo("sweep: no hay modelo calibrado compatible; corre `calibrate` primero")
+        raise typer.Exit(1)
+    if not training_rows:
+        typer.echo("sweep: no hay decisiones con outcome verificado en la base")
+        raise typer.Exit(1)
+    cells = run_sweep(training_rows, model, settings.paper_taker_fee_rate)
+    ranked = sorted((cell for cell in cells if cell.trades > 0), key=lambda c: c.pnl_usdc, reverse=True)
+    typer.echo("- sweep (1 trade por mercado, fees incluidos), top 10 por PnL:")
+    for cell in ranked[:10]:
+        typer.echo(
+            f"  p>={cell.min_probability} sec>={cell.min_seconds_to_close} "
+            f"banda={cell.price_band[0]}-{cell.price_band[1]} solo15m={cell.only_15m} | "
+            f"n={cell.trades} WR={_fmt_pct(cell.win_rate)} pnl={cell.pnl_usdc:+.2f}"
+        )
+    best = recommend(cells, target_win_rate=target_wr)
+    if best is None:
+        typer.echo(f"- sin recomendacion: ninguna celda cumple WR>={target_wr:.0%} con trades suficientes")
+        return
+    typer.echo(f"- recomendado (WR={_fmt_pct(best.win_rate)}, n={best.trades}, pnl={best.pnl_usdc:+.2f}); lineas .env:")
+    for line in recommended_env_lines(best):
+        typer.echo(f"  {line}")
+
+
+@app.command()
+def calibrate(
+    min_samples: int = typer.Option(500, min=1, help="Minimum training rows required to train."),
+    output: str | None = typer.Option(None, help="Where to write the model JSON (defaults to settings path)."),
+) -> None:
+    """Train the market-anchored probability model on ALL recorded decisions (both sides).
+
+    Uses walk-forward (chronological 80/20) validation and reports the market
+    baseline so overfit models are visible before deploying.
+    """
+    settings = _settings()
+    with connect(settings.sqlite_path) as conn:
+        training_rows = build_training_rows(conn)
+    if len(training_rows) < min_samples:
+        typer.echo(f"not enough training rows to calibrate: have {len(training_rows)}, need {min_samples}")
+        raise typer.Exit(1)
+
+    rows = [row.features for row in training_rows]
+    labels = [row.label for row in training_rows]
+    typer.echo(f"training rows={len(rows)} (markets={len({row.market_id for row in training_rows})}) base_rate={sum(labels) / len(labels):.3f}")
+
+    report = walk_forward(rows, labels)
+    typer.echo("walk-forward (80/20 cronologico):")
+    typer.echo(
+        f"- train n={report['train_samples']} log_loss={report['train_log_loss']:.4f} | "
+        f"test n={report['test_samples']} log_loss={report['test_log_loss']:.4f} acc={report['test_accuracy']:.3f}"
+    )
+    typer.echo(f"- baseline mercado (ask como prob): log_loss={report['market_log_loss']:.4f}")
+    if report["test_log_loss"] >= report["market_log_loss"]:
+        typer.echo("- ADVERTENCIA: el modelo NO supera al mercado out-of-sample; no conviene usarlo para tradear")
+    typer.echo("- WR out-of-sample por cutoff:")
+    for item in report["wr_by_cutoff"]:
+        typer.echo(f"  p>={item['cutoff']:.2f}: n={item['n']} WR={_fmt_pct(item['win_rate'])}")
+
+    model = fit_logistic(rows, labels)
+    destination = output or str(settings.probability_model_path)
+    model.save(destination)
+    typer.echo(f"- full-data log_loss={log_loss(model, rows, labels):.4f} accuracy={accuracy(model, rows, labels):.3f}")
+    typer.echo(f"- weights={[round(w, 3) for w in model.weights]} bias={round(model.bias, 3)}")
+    typer.echo(f"- saved model to {destination}")
+    typer.echo("enable it by keeping ENABLE_EXPERIMENTAL_STRATEGY=true; the strategy loads it automatically")
 
 
 @app.command("rag-index")
@@ -205,9 +339,13 @@ def _fmt_pct(value) -> str:
     return "--" if value is None else f"{float(value) * 100:.1f}%"
 
 
+def _fmt_num(value) -> str:
+    return "--" if value is None else f"{float(value):.3f}"
+
+
 @app.command()
-def live() -> None:
-    """Run live mode only if explicitly enabled and safety checks pass."""
+def live(max_cycles: int | None = typer.Option(None, help="Stop after N cycles; useful for tests/smoke checks.")) -> None:
+    """Run the live trading loop, only if explicitly enabled and safety checks pass."""
     settings = _settings()
     if not settings.enable_live_trading:
         typer.echo("ENABLE_LIVE_TRADING=false; live mode blocked")
@@ -224,7 +362,9 @@ def live() -> None:
     if geoblock.blocked:
         typer.echo(f"geoblock blocked live mode: {geoblock.reason}")
         raise typer.Exit(1)
-    typer.echo("live startup checks passed; long-running live loop is not started by this scaffold command")
+    typer.echo("live startup checks passed; starting live loop (Ctrl+C to stop)")
+    configure_logging(settings)
+    asyncio.run(run_live_loop(settings, max_cycles=max_cycles))
 
 
 @app.command()

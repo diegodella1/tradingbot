@@ -32,3 +32,29 @@ class OrderManager:
         if order.filled_size_usdc > 0:
             self.risk_manager.record_trade(context.market.market_id, order.filled_size_usdc, request.token_id)
         return order, decision
+
+    def execute_exit_signal(self, signal: Signal, context: MarketContext, position: dict):
+        """Close an open paper position at the bid. `position` needs token_id, shares, cost_usdc, fee_usdc."""
+        if signal.action != SignalAction.EXIT:
+            return None, 0.0
+        token_side = OutcomeSide.UP if position.get("side") == OutcomeSide.UP.value else OutcomeSide.DOWN
+        book: OrderBook | None = context.up_book if token_side == OutcomeSide.UP else context.down_book
+        if book is None:
+            return None, 0.0
+
+        shares = float(position.get("shares") or 0.0)
+        cost = float(position.get("cost_usdc") or 0.0)
+        entry_fee = float(position.get("fee_usdc") or 0.0)
+        request = OrderRequest(
+            market_id=context.market.market_id,
+            token_id=str(position.get("token_id")),
+            side=OrderSide.SELL,
+            price=signal.max_price,
+            size_usdc=max(cost, 1e-6),
+            reason=signal.reason,
+        )
+        order, proceeds, exit_fee = self.paper_broker.place_sell_order(request, book, shares)
+        if order.filled_size_usdc <= 0:
+            return order, 0.0
+        realized = proceeds - cost - entry_fee - exit_fee
+        return order, realized

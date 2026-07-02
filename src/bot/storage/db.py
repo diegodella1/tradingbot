@@ -36,6 +36,12 @@ CREATE TABLE IF NOT EXISTS btc_ticks (
   price REAL NOT NULL,
   created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS market_open_prices (
+  market_id TEXT PRIMARY KEY,
+  price REAL NOT NULL,
+  source TEXT,
+  created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS signals (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   market_id TEXT NOT NULL,
@@ -219,6 +225,19 @@ def init_db(path: Path) -> None:
         _backfill_open_positions(conn)
         _expire_unknown_positions(conn)
         _settle_binary_positions(conn)
+
+
+def refresh_settlements(conn: sqlite3.Connection) -> None:
+    """Backfill/expire/settle positions on an existing connection.
+
+    Lightweight per-cycle alternative to init_db: it skips re-running the full
+    schema DDL and reconnecting, but keeps settlement (and therefore realized
+    PnL / loss-streak risk state) up to date while the paper loop runs.
+    """
+    _backfill_open_positions(conn)
+    _expire_unknown_positions(conn)
+    _settle_binary_positions(conn)
+    conn.commit()
 
 
 def force_settle_pending_positions(path: Path) -> dict[str, int]:

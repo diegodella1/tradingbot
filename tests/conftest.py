@@ -10,7 +10,12 @@ from bot.polymarket.models import BookLevel, BtcMarketState, MarketContext, Mark
 
 @pytest.fixture()
 def settings(tmp_path):
-    return Settings(sqlite_path=tmp_path / "bot.sqlite3", kill_switch_file=tmp_path / "KILL_SWITCH")
+    return Settings(
+        sqlite_path=tmp_path / "bot.sqlite3",
+        kill_switch_file=tmp_path / "KILL_SWITCH",
+        # Keep tests hermetic: never pick up a real trained model from the repo root.
+        probability_model_path=tmp_path / "probability_model.json",
+    )
 
 
 @pytest.fixture()

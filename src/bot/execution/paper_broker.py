@@ -54,6 +54,43 @@ class PaperBroker:
         )
         return record
 
+    def place_sell_order(self, request: OrderRequest, book: OrderBook, shares: float) -> tuple[OrderRecord, float, float]:
+        """Simulate closing a position by selling `shares` at the bid.
+
+        Returns (order, proceeds_usdc, fee_usdc). Used for early EXIT signals; buy
+        entries continue to go through place_limit_order.
+        """
+        order_id = f"paper-exit-{uuid4()}"
+        best_bid = book.best_bid
+        if best_bid is None or shares <= 0:
+            record = OrderRecord(order_id=order_id, request=request, status=OrderStatus.REJECTED)
+            self.orders[order_id] = record
+            return record, 0.0, 0.0
+
+        slippage = self.settings.paper_slippage_cents / 100
+        fill_price = max(0.0, best_bid - slippage)
+        if fill_price < request.price:  # limit floor not met
+            record = OrderRecord(order_id=order_id, request=request, status=OrderStatus.OPEN)
+            self.orders[order_id] = record
+            return record, 0.0, 0.0
+
+        proceeds = shares * fill_price
+        fee = polymarket_taker_fee_usdc(shares, fill_price, self.settings.paper_taker_fee_rate) if self.settings.paper_enable_fees else 0.0
+        record = OrderRecord(order_id=order_id, request=request, status=OrderStatus.FILLED, filled_size_usdc=proceeds, avg_fill_price=fill_price)
+        self.orders[order_id] = record
+        self.fills.append(
+            FillRecord(
+                order_id=order_id,
+                market_id=request.market_id,
+                token_id=request.token_id,
+                side=OrderSide.SELL,
+                price=fill_price,
+                size_usdc=proceeds,
+                fee_usdc=fee,
+            )
+        )
+        return record, proceeds, fee
+
     def cancel_order(self, order_id: str, reason: str = "") -> OrderRecord | None:
         record = self.orders.get(order_id)
         if record and record.status in {OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED}:

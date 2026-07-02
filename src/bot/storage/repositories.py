@@ -12,6 +12,16 @@ def now_text() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _parse_utc(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
 class Repository:
     def __init__(self, conn: sqlite3.Connection):
         self.conn = conn
@@ -86,6 +96,38 @@ class Repository:
     def save_btc_tick(self, price: float) -> None:
         self.conn.execute("INSERT INTO btc_ticks (price, created_at) VALUES (?, ?)", (price, now_text()))
         self.conn.commit()
+
+    def get_market_open_price(self, market_id: str) -> float | None:
+        row = self.conn.execute("SELECT price FROM market_open_prices WHERE market_id = ?", (market_id,)).fetchone()
+        return float(row["price"]) if row else None
+
+    def save_market_open_price(self, market_id: str, price: float, source: str = "tick") -> None:
+        self.conn.execute(
+            "INSERT OR IGNORE INTO market_open_prices (market_id, price, source, created_at) VALUES (?, ?, ?, ?)",
+            (market_id, price, source, now_text()),
+        )
+        self.conn.commit()
+
+    def nearest_btc_tick(self, target_iso: str) -> float | None:
+        """Return the BTC tick price closest in time to `target_iso` (before or after)."""
+        after = self.conn.execute(
+            "SELECT price, created_at FROM btc_ticks WHERE created_at >= ? ORDER BY created_at ASC LIMIT 1",
+            (target_iso,),
+        ).fetchone()
+        before = self.conn.execute(
+            "SELECT price, created_at FROM btc_ticks WHERE created_at < ? ORDER BY created_at DESC LIMIT 1",
+            (target_iso,),
+        ).fetchone()
+        if after and not before:
+            return float(after["price"])
+        if before and not after:
+            return float(before["price"])
+        if not before and not after:
+            return None
+        target = _parse_utc(target_iso)
+        after_gap = abs((_parse_utc(after["created_at"]) - target).total_seconds())
+        before_gap = abs((_parse_utc(before["created_at"]) - target).total_seconds())
+        return float(after["price"]) if after_gap <= before_gap else float(before["price"])
 
     def save_risk_event(self, market_id: str | None, decision: RiskDecision) -> None:
         self.conn.execute(
@@ -190,7 +232,71 @@ class Repository:
             state.market_exposure[row["market_id"]] = state.market_exposure.get(row["market_id"], 0.0) + exposure
             state.token_exposure[row["token_id"]] = state.token_exposure.get(row["token_id"], 0.0) + exposure
             state.trades_by_market[row["market_id"]] = state.trades_by_market.get(row["market_id"], 0) + 1
+        self._apply_pnl_risk_state(state)
         return state
+
+    def _apply_pnl_risk_state(self, state: RiskState) -> None:
+        """Populate loss-tracking fields so daily-loss/streak/cooldown gates work at runtime.
+
+        Covers settled binaries (WON/LOST) and exit-closed positions (CLOSED); a loss
+        is any settled position with negative realized PnL.
+        """
+        day_start = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+        daily = self.conn.execute(
+            """
+            SELECT COALESCE(SUM(realized_pnl_usdc), 0)
+            FROM positions
+            WHERE status IN ('WON', 'LOST', 'CLOSED') AND settled_at IS NOT NULL AND settled_at >= ?
+            """,
+            (day_start,),
+        ).fetchone()
+        state.daily_pnl_usdc = float(daily[0] or 0)
+
+        recent = self.conn.execute(
+            """
+            SELECT realized_pnl_usdc, settled_at
+            FROM positions
+            WHERE status IN ('WON', 'LOST', 'CLOSED') AND settled_at IS NOT NULL
+            ORDER BY settled_at DESC
+            LIMIT 50
+            """
+        ).fetchall()
+        streak = 0
+        for row in recent:
+            if float(row["realized_pnl_usdc"] or 0) < 0:
+                streak += 1
+            else:
+                break
+        state.consecutive_losses = streak
+        state.last_loss_at = _parse_utc(recent[0]["settled_at"]) if recent and float(recent[0]["realized_pnl_usdc"] or 0) < 0 else None
+
+    def get_open_position(self, market_id: str) -> dict | None:
+        row = self.conn.execute(
+            """
+            SELECT id, token_id, shares, size_usdc, fee_usdc, avg_price
+            FROM positions
+            WHERE market_id = ? AND status = 'OPEN'
+            ORDER BY id DESC LIMIT 1
+            """,
+            (market_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def save_exit_fill(self, fill: FillRecord, realized_pnl_usdc: float) -> None:
+        """Persist a closing SELL fill without mutating position size (see close_position)."""
+        self.conn.execute(
+            "INSERT INTO fills (order_id, market_id, token_id, side, price, size_usdc, fee_usdc, pnl_usdc, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (fill.order_id, fill.market_id, fill.token_id, fill.side.value, fill.price, fill.size_usdc, fill.fee_usdc, realized_pnl_usdc, fill.created_at.isoformat()),
+        )
+        self.conn.commit()
+
+    def close_position(self, position_id: int, realized_pnl_usdc: float) -> None:
+        now = now_text()
+        self.conn.execute(
+            "UPDATE positions SET status = 'CLOSED', realized_pnl_usdc = ?, settled_at = ?, updated_at = ? WHERE id = ?",
+            (realized_pnl_usdc, now, now, position_id),
+        )
+        self.conn.commit()
 
     def save_learning_note(self, note: str, tags: str = "") -> None:
         self.conn.execute(

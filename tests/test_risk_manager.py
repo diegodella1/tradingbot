@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from bot.execution.risk_manager import RiskManager, RiskState
-from bot.polymarket.models import Signal, SignalAction
+from bot.polymarket.models import OutcomeSide, Signal, SignalAction
 
 
 def buy_signal():
@@ -72,6 +72,21 @@ def test_daily_loss_blocks_trading(settings, context):
     decision = risk.validate(buy_signal(), context)
     assert decision.approved is False
     assert "daily loss" in decision.reason
+
+
+def test_token_exposure_limit_blocks_trading(settings, context):
+    token_id = context.market.tokens[OutcomeSide.UP].token_id
+    risk = RiskManager(settings, RiskState(token_exposure={token_id: settings.max_token_position_usdc}))
+    decision = risk.validate(buy_signal(), context)
+    assert decision.approved is False
+    assert "token exposure" in decision.reason
+
+
+def test_consecutive_losses_block_trading(settings, context):
+    risk = RiskManager(settings, RiskState(consecutive_losses=settings.max_consecutive_losses))
+    decision = risk.validate(buy_signal(), context)
+    assert decision.approved is False
+    assert "consecutive loss" in decision.reason
 
 
 @pytest.mark.asyncio

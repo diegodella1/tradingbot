@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
 from bot.config import Settings
-from bot.polymarket.models import MarketContext, OrderBook, Signal, SignalAction
+from bot.polymarket.models import MarketContext, OrderBook, OutcomeSide, Signal, SignalAction
 
 
 @dataclass
@@ -66,6 +66,11 @@ class RiskManager:
             return RiskDecision(False, "market already has open paper position")
         if current_market_exposure + signal.size_usdc > self.settings.max_market_position_usdc:
             return RiskDecision(False, "market exposure limit hit")
+        token_id = self._token_id_for_signal(signal, context)
+        if token_id is not None:
+            current_token_exposure = self.state.token_exposure.get(token_id, 0.0)
+            if current_token_exposure + signal.size_usdc > self.settings.max_token_position_usdc:
+                return RiskDecision(False, "token exposure limit hit")
         if sum(self.state.market_exposure.values()) > 0 and context.market.market_id not in self.state.market_exposure:
             return RiskDecision(False, "one open position limit hit")
         if sum(self.state.market_exposure.values()) + signal.size_usdc > self.settings.paper_bankroll_usdc:
@@ -89,6 +94,18 @@ class RiskManager:
         if signal.action == SignalAction.BUY_DOWN:
             return context.down_book
         return context.up_book or context.down_book
+
+    @staticmethod
+    def _token_id_for_signal(signal: Signal, context: MarketContext) -> str | None:
+        side = None
+        if signal.action == SignalAction.BUY_UP:
+            side = OutcomeSide.UP
+        elif signal.action == SignalAction.BUY_DOWN:
+            side = OutcomeSide.DOWN
+        if side is None:
+            return None
+        token = context.market.tokens.get(side)
+        return token.token_id if token else None
 
     def record_trade(self, market_id: str, size_usdc: float, token_id: str | None = None) -> None:
         self.state.market_exposure[market_id] = self.state.market_exposure.get(market_id, 0.0) + size_usdc

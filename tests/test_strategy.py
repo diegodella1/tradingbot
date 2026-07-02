@@ -143,6 +143,40 @@ def test_strategy_allows_sub_dollar_kelly_size(settings, context):
     assert 0 < signal.size_usdc < 1
 
 
+def test_strategy_blocks_low_estimated_probability(settings, context):
+    settings.enable_experimental_strategy = True
+    settings.min_confidence = 0.1
+    settings.min_estimated_probability = 0.95  # above what the heuristic can produce here
+    context.up_book.asks[0].price = 0.40
+    context.up_book.bids[0].price = 0.39
+    context.up_book.asks[0].size = 1000
+    context.up_book.bids[0].size = 2000
+    context.btc.current_price = 102
+    context.btc.market_open_price = 100
+    context.btc.momentum_15s = 0.003
+    context.btc.momentum_60s = 0.004
+
+    signal = MomentumBookImbalanceStrategy(settings).evaluate(context)
+
+    assert signal.action == SignalAction.HOLD
+    assert "probability below minimum" in signal.reason
+
+
+def test_strategy_blocks_extreme_volatility_regime(settings, context):
+    settings.enable_experimental_strategy = True
+    settings.max_realized_volatility = 0.001
+    context.btc.realized_volatility = 0.005
+    context.btc.current_price = 102
+    context.btc.market_open_price = 100
+    context.btc.momentum_15s = 0.003
+    context.btc.momentum_60s = 0.004
+
+    signal = MomentumBookImbalanceStrategy(settings).evaluate(context)
+
+    assert signal.action == SignalAction.HOLD
+    assert "volatility" in signal.reason
+
+
 def test_strategy_requires_aligned_btc_momentum(settings, context):
     settings.enable_experimental_strategy = True
     settings.min_confidence = 0.1

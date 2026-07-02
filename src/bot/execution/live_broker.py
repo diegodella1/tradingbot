@@ -109,6 +109,45 @@ class LiveBroker:
                 return method(*args)
         return None
 
+    async def get_order_status(self, order_id: str) -> OrderStatus | None:
+        """Best-effort reconciliation of a live order's status via the SDK.
+
+        Returns None if the SDK/method is unavailable so callers can fall back to
+        their locally tracked status. A full user-channel websocket reconciliation
+        can layer on top of this later.
+        """
+        if not self.settings.enable_live_trading or not order_id:
+            return None
+        try:
+            client = self._client()
+        except LiveTradingDisabled:
+            return None
+        getter = getattr(client, "get_order", None) or getattr(client, "getOrder", None)
+        if getter is None:
+            return None
+        try:
+            response = getter(order_id)
+        except Exception:
+            return None
+        return self._map_status(response)
+
+    @staticmethod
+    def _map_status(response: object) -> OrderStatus | None:
+        if not isinstance(response, dict):
+            return None
+        status_text = str(response.get("status") or "").lower()
+        size = float(response.get("size_matched") or response.get("sizeMatched") or 0)
+        original = float(response.get("original_size") or response.get("originalSize") or 0)
+        if status_text in {"matched", "filled"} or (original > 0 and size >= original):
+            return OrderStatus.FILLED
+        if size > 0:
+            return OrderStatus.PARTIALLY_FILLED
+        if status_text in {"canceled", "cancelled"}:
+            return OrderStatus.CANCELED
+        if status_text in {"live", "delayed", "unmatched", "open"}:
+            return OrderStatus.OPEN
+        return None
+
     async def cancel_order(self, order_id: str) -> None:
         if not self.settings.enable_live_trading:
             return

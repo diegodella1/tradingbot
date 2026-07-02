@@ -4,6 +4,7 @@ from bot.config import Settings
 from bot.execution.paper_broker import polymarket_taker_fee_usdc
 from bot.polymarket.models import MarketContext, OrderBook, OutcomeSide, Signal, SignalAction
 from bot.strategy.base import Strategy
+from bot.strategy.calibration import ProbabilityModel, build_features
 
 
 def kelly_fraction(probability: float, price: float) -> float:
@@ -15,6 +16,11 @@ def kelly_fraction(probability: float, price: float) -> float:
 class MomentumBookImbalanceStrategy(Strategy):
     def __init__(self, settings: Settings):
         self.settings = settings
+        # A calibrated model (trained via `cli calibrate`) supersedes the hand-tuned
+        # heuristic when present; otherwise we fall back to the heuristic scoring.
+        # Models trained with an older feature layout are ignored, not misapplied.
+        model = ProbabilityModel.load(settings.probability_model_path)
+        self.model: ProbabilityModel | None = model if model is not None and model.is_compatible() else None
 
     def evaluate(self, context: MarketContext) -> Signal:
         if not self.settings.enable_experimental_strategy:
@@ -29,6 +35,9 @@ class MomentumBookImbalanceStrategy(Strategy):
             return Signal(action=SignalAction.HOLD, reason="stale BTC feed")
         if context.market.seconds_to_close is None or context.market.seconds_to_close < self.settings.min_seconds_to_close:
             return Signal(action=SignalAction.HOLD, reason="too close to market close")
+        if context.btc.realized_volatility > self.settings.max_realized_volatility:
+            # In extreme volatility regimes the outcome is close to a coin flip.
+            return Signal(action=SignalAction.HOLD, reason="volatility regime too extreme")
 
         up = self._candidate(SignalAction.BUY_UP, context.up_book, context)
         down = self._candidate(SignalAction.BUY_DOWN, context.down_book, context)
@@ -66,12 +75,15 @@ class MomentumBookImbalanceStrategy(Strategy):
         if book_support < self.settings.min_book_imbalance:
             return Signal(action=SignalAction.HOLD, reason="book imbalance not supportive", metadata={"features": features})
 
-        momentum_score = max(-1.0, min(1.0, (momentum_15 * 6000) + (momentum_60 * 3000)))
-        open_score = max(-1.0, min(1.0, open_move / 35))
-        book_score = max(-1.0, min(1.0, book_support * 2.5))
-        volatility_penalty = min(0.08, context.btc.realized_volatility * 80)
-        raw_probability = 0.5 + (0.12 * momentum_score) + (0.08 * open_score) + (0.06 * book_score) - volatility_penalty
-        estimated_probability = max(0.01, min(0.99, raw_probability))
+        estimated_probability, probability_source = self._estimate_probability(context, book, ask, direction)
+        if estimated_probability < self.settings.min_estimated_probability:
+            # Underdogs with nominal edge lost consistently in production data
+            # (0% WR below p=0.6); winning often requires being the favorite.
+            return Signal(
+                action=SignalAction.HOLD,
+                reason="estimated probability below minimum",
+                metadata={"features": features, "estimated_probability": estimated_probability},
+            )
         edge = estimated_probability - ask
         shares_per_1 = 1 / ask if ask > 0 else 0.0
         profit_if_win_per_1 = shares_per_1 - 1
@@ -91,6 +103,7 @@ class MomentumBookImbalanceStrategy(Strategy):
         )
         metadata = {
             "estimated_probability": estimated_probability,
+            "probability_source": probability_source,
             "market_price": ask,
             "edge": edge,
             "edge_cents": edge * 100,
@@ -128,3 +141,55 @@ class MomentumBookImbalanceStrategy(Strategy):
             reason="positive EV momentum/book decision",
             metadata=metadata,
         )
+
+    def _estimate_probability(self, context: MarketContext, book: OrderBook, price: float, direction: int) -> tuple[float, str]:
+        """Estimate P(chosen side wins). Uses the calibrated model if loaded, else the heuristic."""
+        if self.model is not None:
+            features = build_features(
+                momentum_15s=context.btc.momentum_15s,
+                momentum_60s=context.btc.momentum_60s,
+                change_since_open=context.btc.change_since_open,
+                realized_volatility=context.btc.realized_volatility,
+                book_imbalance=book.imbalance,
+                implied=price,
+                sign=direction,
+                seconds_to_close=float(context.market.seconds_to_close or 0.0),
+            )
+            return max(0.01, min(0.99, self.model.predict_proba(features))), "calibrated"
+
+        momentum_15 = direction * context.btc.momentum_15s
+        momentum_60 = direction * context.btc.momentum_60s
+        open_move = direction * context.btc.change_since_open
+        book_support = direction * book.imbalance
+        momentum_score = max(-1.0, min(1.0, (momentum_15 * 6000) + (momentum_60 * 3000)))
+        open_score = max(-1.0, min(1.0, open_move / 35))
+        book_score = max(-1.0, min(1.0, book_support * 2.5))
+        volatility_penalty = min(0.08, context.btc.realized_volatility * 80)
+        raw_probability = 0.5 + (0.12 * momentum_score) + (0.08 * open_score) + (0.06 * book_score) - volatility_penalty
+        return max(0.01, min(0.99, raw_probability)), "heuristic"
+
+    def evaluate_exit(self, context: MarketContext, held_side: OutcomeSide, entry_price: float) -> Signal:
+        """Emit EXIT when an open position's win probability deteriorates.
+
+        Disabled by default: when ``hold_to_resolution`` is true or exit signals are
+        off, positions are always held to settlement (returns HOLD).
+        """
+        if self.settings.hold_to_resolution or not self.settings.enable_exit_signals:
+            return Signal(action=SignalAction.HOLD, reason="hold to resolution")
+        book = context.up_book if held_side == OutcomeSide.UP else context.down_book
+        if book is None or book.best_bid is None:
+            return Signal(action=SignalAction.HOLD, reason="missing exit book")
+        direction = 1 if held_side == OutcomeSide.UP else -1
+        probability, source = self._estimate_probability(context, book, book.best_bid, direction)
+        metadata = {"estimated_probability": probability, "probability_source": source, "entry_price": entry_price}
+        if probability < self.settings.exit_min_probability:
+            # Protective sell floor that still tolerates simulated slippage at the bid.
+            sell_floor = max(0.0, book.best_bid - 2 * (self.settings.paper_slippage_cents / 100))
+            return Signal(
+                action=SignalAction.EXIT,
+                confidence=max(0.0, min(1.0, 1 - probability)),
+                max_price=sell_floor,
+                reason="win probability deteriorated",
+                metadata=metadata,
+            )
+        return Signal(action=SignalAction.HOLD, reason="position still favorable", metadata=metadata)

@@ -9,7 +9,7 @@ from bot.execution.risk_manager import RiskManager, RiskState
 from bot.main import _sync_risk_state, run_paper_loop
 from bot.polymarket.clob import ClobClient
 from bot.polymarket.gamma import GammaClient
-from bot.polymarket.models import BtcMarketState, MarketType, OutcomeSide, OrderBook, BookLevel
+from bot.polymarket.models import BookLevel, BtcMarketState, MarketType, OrderBook
 from bot.storage.db import connect, init_db
 from bot.storage.repositories import Repository
 

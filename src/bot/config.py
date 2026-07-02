@@ -40,6 +40,8 @@ class Settings(BaseSettings):
     clock_skew_max_seconds: float = 2.0
 
     price_feed: Literal["coinbase"] = "coinbase"
+    enable_websocket_feeds: bool = False
+    websocket_book_max_age_seconds: float = 5.0
     btc_symbol: str = "BTC-USD"
     market_types: Annotated[list[str], NoDecode] = Field(default_factory=lambda: ["5m", "15m"])
     kill_switch_file: Path = Path("./KILL_SWITCH")
@@ -53,8 +55,12 @@ class Settings(BaseSettings):
     paper_trade_size_usdc: float = 1.0
     live_bankroll_usdc: float = 10.0
     live_trade_size_usdc: float = 1.0
+    live_loop_interval_seconds: float = 3.0
+    alert_webhook_url: str = ""
     min_edge_cents: float = 3.0
     min_confidence: float = 0.65
+    min_estimated_probability: float = 0.60
+    max_realized_volatility: float = 0.001
     min_entry_price: float = 0.10
     max_entry_price: float = 0.90
     min_profit_if_win_usdc: float = 0.70
@@ -64,9 +70,12 @@ class Settings(BaseSettings):
     min_kelly_size_usdc: float = 1.0
     max_token_position_usdc: float = 1.0
     hold_to_resolution: bool = True
+    enable_exit_signals: bool = False
+    exit_min_probability: float = 0.40
+    probability_model_path: Path = Path("./probability_model.json")
     cancel_unfilled_after_seconds: int = 20
     enable_learning_recommendations: bool = True
-    rag_paths: Annotated[list[Path], NoDecode] = Field(default_factory=lambda: [Path("./README.md"), Path("./docs"), Path("/home/diego/Documents/diegodella")])
+    rag_paths: Annotated[list[Path], NoDecode] = Field(default_factory=lambda: [Path("./README.md"), Path("./docs")])
     rag_obsidian_vault_path: Path | None = None
     polymarket_signature_type: int = 3
     polymarket_funder_address: str = ""
