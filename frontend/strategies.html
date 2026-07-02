@@ -1,0 +1,184 @@
+<!doctype html>
+<html class="dark" lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta content="width=device-width, initial-scale=1.0" name="viewport" />
+    <title>PolyBot BTC - Strategies</title>
+    <script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&display=swap" rel="stylesheet" />
+    <link href="https://fonts.googleapis.com/css2?family=Hanken+Grotesk:wght@400;500;600;700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />
+    <script>
+      tailwind.config = {
+        darkMode: "class",
+        theme: {
+          extend: {
+            colors: {
+              "surface": "#0b1326",
+              "background": "#0b1326",
+              "surface-container-low": "#131b2e",
+              "surface-container": "#171f33",
+              "surface-container-high": "#222a3d",
+              "surface-container-highest": "#2d3449",
+              "surface-variant": "#2d3449",
+              "surface-glass": "rgba(30, 41, 59, 0.7)",
+              "outline": "#8c90a2",
+              "outline-variant": "#424656",
+              "on-surface": "#dae2fd",
+              "on-surface-variant": "#c2c6d9",
+              "primary": "#b4c5ff",
+              "primary-container": "#0062ff",
+              "secondary": "#4edea3",
+              "secondary-container": "#00a572",
+              "btc-blue": "#00A3FF",
+              "profit-emerald": "#34D399",
+              "loss-rose": "#FB7185",
+              "warning-amber": "#F59E0B",
+              "tertiary-container": "#d5264a"
+            },
+            borderRadius: { DEFAULT: "0.25rem", lg: "0.5rem", xl: "0.75rem", full: "9999px" },
+            spacing: { "margin-mobile": "16px", "gutter": "16px", "margin-desktop": "32px", "container-max": "1440px" },
+            fontFamily: {
+              headline: ["Hanken Grotesk", "sans-serif"],
+              body: ["Inter", "sans-serif"],
+              data: ["JetBrains Mono", "monospace"]
+            }
+          }
+        }
+      };
+    </script>
+    <link rel="stylesheet" href="/styles.css?v=20260701-5" />
+    <style>
+      input[type="range"] { -webkit-appearance: none; width: 100%; background: transparent; }
+      input[type="range"]::-webkit-slider-thumb {
+        -webkit-appearance: none; height: 16px; width: 16px; border-radius: 9999px;
+        background: #b4c5ff; cursor: not-allowed; margin-top: -6px; box-shadow: 0 0 10px rgba(180, 197, 255, 0.45);
+      }
+      input[type="range"]::-webkit-slider-runnable-track { width: 100%; height: 4px; background: #2d3449; border-radius: 2px; }
+      .strategy-card { background: rgba(30, 41, 59, 0.4); backdrop-filter: blur(12px); border: 1px solid rgba(255, 255, 255, 0.1); }
+    </style>
+  </head>
+  <body class="app-body">
+    <a class="sr-only focus:not-sr-only focus:fixed focus:left-4 focus:top-4 focus:z-[100] focus:rounded-lg focus:bg-primary focus:px-4 focus:py-2 focus:text-surface" href="#main">Skip to main content</a>
+    <nav class="app-sidebar" aria-label="Primary navigation">
+      <div class="mb-10 px-4">
+        <h1 class="brand-title">PolyBot BTC</h1>
+        <p class="brand-subtitle">Paper Trading Console</p>
+      </div>
+      <div class="flex-1 space-y-2">
+        <a class="side-link" href="/"><span class="material-symbols-outlined">dashboard</span><span>Dashboard</span></a>
+        <a class="side-link side-link-active" href="/strategies.html" aria-current="page"><span class="material-symbols-outlined" style="font-variation-settings:'FILL' 1;">architecture</span><span>Strategies</span></a>
+        <a class="side-link" href="/analytics.html"><span class="material-symbols-outlined">analytics</span><span>Analytics</span></a>
+      </div>
+      <div class="mt-auto">
+        <button class="w-full py-3 px-4 bg-btc-blue/20 border border-btc-blue/40 text-btc-blue text-xs uppercase tracking-wide font-bold rounded-lg flex items-center justify-center gap-2 cursor-not-allowed" type="button" disabled>
+          <span class="material-symbols-outlined text-sm">lock</span>
+          Read-only Config
+        </button>
+        <div class="mt-6 flex items-center gap-3 px-4 pt-4 border-t border-outline-variant">
+          <div class="w-8 h-8 rounded-full bg-surface-container-highest border border-outline-variant bot-avatar" aria-hidden="true"></div>
+          <div class="flex flex-col overflow-hidden">
+            <span class="text-sm truncate">Operator_99</span>
+            <span id="navStatus" class="text-[10px] text-on-surface-variant uppercase tracking-wider truncate">sync pending</span>
+          </div>
+        </div>
+      </div>
+    </nav>
+
+    <div id="main" class="app-main flex flex-col min-w-0 relative">
+      <header class="app-topbar">
+        <div class="min-w-0">
+          <h2 class="topbar-title">Strategies</h2>
+          <div class="truncate text-xs font-data text-outline">Runtime parameters and decision log</div>
+        </div>
+        <div class="flex items-center gap-4 md:gap-6">
+          <div class="hidden sm:flex items-center gap-2">
+            <span id="connectionDot" class="status-dot"></span>
+            <span id="connectionLabel" class="status-pill">Loading</span>
+          </div>
+          <div id="bankrollLabel" class="status-pill">$--</div>
+          <a aria-label="dashboard" class="p-2 text-on-surface-variant hover:text-primary rounded-full hover:bg-surface-container" href="/"><span class="material-symbols-outlined">dashboard</span></a>
+        </div>
+      </header>
+
+      <main class="app-content w-full z-10 relative">
+        <div class="mb-8">
+          <h1 class="page-heading">Trading Strategies</h1>
+          <p id="updatedAt" class="page-copy">Loading strategy runtime from SQLite and paper loop.</p>
+        </div>
+
+        <div class="grid grid-cols-1 lg:grid-cols-12 gap-6 mb-8">
+          <section id="strategyCards" class="lg:col-span-12 grid grid-cols-1 lg:grid-cols-2 gap-6"></section>
+
+          <section id="engine" class="strategy-card rounded-xl p-6 lg:col-span-12">
+            <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-3 mb-6">
+              <h3 class="font-headline text-3xl text-on-surface flex items-center gap-2">
+                <span class="material-symbols-outlined">tune</span>
+                Global Engine Parameters
+              </h3>
+              <span class="text-xs uppercase tracking-wide text-warning-amber">read-only until backend approval</span>
+            </div>
+            <div id="engineParams" class="grid grid-cols-1 md:grid-cols-3 xl:grid-cols-4 gap-4"></div>
+          </section>
+
+          <section id="safety" class="strategy-card rounded-xl p-6 lg:col-span-5">
+            <h3 class="text-lg font-semibold text-on-surface mb-4 flex items-center gap-2"><span class="material-symbols-outlined text-btc-blue">security</span> Safety Gates</h3>
+            <div id="safetyGates" class="space-y-3"></div>
+          </section>
+
+          <section class="strategy-card rounded-xl p-6 lg:col-span-7">
+            <h3 class="text-lg font-semibold text-on-surface mb-4 flex items-center gap-2"><span class="material-symbols-outlined text-btc-blue">query_stats</span> Timeframe Metrics</h3>
+            <div id="timeframeMetrics" class="grid grid-cols-1 md:grid-cols-2 gap-4"></div>
+          </section>
+
+          <section class="strategy-card rounded-xl p-6 lg:col-span-12">
+            <div class="flex flex-col md:flex-row md:items-start md:justify-between gap-3 mb-5">
+              <div>
+                <h3 class="text-lg font-semibold text-on-surface flex items-center gap-2"><span class="material-symbols-outlined text-btc-blue">schema</span> Execution Funnel</h3>
+                <p id="executionSummary" class="text-sm text-on-surface-variant mt-1">Loading signal, risk and fill counters.</p>
+              </div>
+              <span id="executionWarning" class="text-xs uppercase tracking-wide text-warning-amber"></span>
+            </div>
+            <div id="executionFunnel" class="grid grid-cols-2 md:grid-cols-4 gap-4"></div>
+            <div id="executionBlocks" class="mt-5 grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-3"></div>
+          </section>
+
+          <section class="strategy-card rounded-xl p-6 lg:col-span-12">
+            <div class="flex flex-col md:flex-row md:items-start md:justify-between gap-3 mb-5">
+              <div>
+                <h3 class="text-lg font-semibold text-on-surface flex items-center gap-2"><span class="material-symbols-outlined text-btc-blue">psychology</span> Learning Recommendations</h3>
+                <p id="learningSummary" class="text-sm text-on-surface-variant mt-1">Loading deterministic paper-learning report.</p>
+              </div>
+              <span class="text-xs uppercase tracking-wide text-secondary border border-secondary/30 bg-secondary/10 rounded-full px-3 py-1">recommend only</span>
+            </div>
+            <div id="learningRecommendations" class="grid grid-cols-1 lg:grid-cols-2 gap-4"></div>
+            <div id="learningReferences" class="mt-5 grid grid-cols-1 md:grid-cols-2 gap-3"></div>
+          </section>
+
+          <section class="strategy-card rounded-xl p-0 lg:col-span-12 overflow-hidden">
+            <div class="p-6 border-b border-outline-variant/50 flex justify-between items-center">
+              <h3 class="font-headline text-3xl text-on-surface">Recent Strategy Decisions</h3>
+              <span id="decisionCount" class="text-xs uppercase tracking-wide text-btc-blue">-- decisions</span>
+            </div>
+            <div class="overflow-x-auto">
+              <table class="w-full text-left border-collapse">
+                <thead>
+                  <tr class="bg-surface-container-low border-b border-outline-variant/50 text-xs uppercase tracking-wide text-on-surface-variant">
+                    <th class="px-6 py-3 font-medium">Time</th>
+                    <th class="px-6 py-3 font-medium">Market</th>
+                    <th class="px-6 py-3 font-medium">Action</th>
+                    <th class="px-6 py-3 font-medium text-right">Edge</th>
+                    <th class="px-6 py-3 font-medium text-right">Kelly</th>
+                    <th class="px-6 py-3 font-medium text-right">Size</th>
+                    <th class="px-6 py-3 font-medium">Reason</th>
+                  </tr>
+                </thead>
+                <tbody id="decisionsTable" class="font-data text-sm divide-y divide-outline-variant/20"></tbody>
+              </table>
+            </div>
+          </section>
+        </div>
+      </main>
+    </div>
+    <script src="/strategies.js?v=20260701-3"></script>
+  </body>
+</html>

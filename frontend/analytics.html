@@ -1,0 +1,187 @@
+<!doctype html>
+<html class="dark" lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta content="width=device-width, initial-scale=1.0" name="viewport" />
+    <title>PolyBot BTC - Analytics</title>
+    <script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&display=swap" rel="stylesheet" />
+    <link href="https://fonts.googleapis.com/css2?family=Hanken+Grotesk:wght@600;700&family=Inter:wght@400;700&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet" />
+    <script>
+      tailwind.config = {
+        darkMode: "class",
+        theme: {
+          extend: {
+            colors: {
+              "profit-emerald": "#34D399",
+              "btc-blue": "#00A3FF",
+              "on-surface": "#dae2fd",
+              "surface-glass": "rgba(30, 41, 59, 0.7)",
+              "surface-variant": "#2d3449",
+              "outline-variant": "#424656",
+              "surface-container-low": "#131b2e",
+              "on-background": "#dae2fd",
+              "warning-amber": "#F59E0B",
+              "surface-container": "#171f33",
+              "on-surface-variant": "#c2c6d9",
+              "surface-container-highest": "#2d3449",
+              "outline": "#8c90a2",
+              "surface-dim": "#0b1326",
+              "surface": "#0b1326",
+              "secondary-container": "#00a572",
+              "secondary": "#4edea3",
+              "primary": "#b4c5ff",
+              "loss-rose": "#FB7185",
+              "surface-container-high": "#222a3d",
+              "background": "#0b1326",
+              "tertiary-container": "#d5264a"
+            },
+            borderRadius: { DEFAULT: "0.25rem", lg: "0.5rem", xl: "0.75rem", full: "9999px" },
+            spacing: { "margin-mobile": "16px", "container-max": "1440px", "margin-desktop": "32px", gutter: "16px" },
+            fontFamily: {
+              "body-md": ["Inter"],
+              "headline-xl": ["Hanken Grotesk"],
+              "data-md": ["JetBrains Mono"],
+              "label-caps": ["Inter"],
+              "headline-lg": ["Hanken Grotesk"],
+              "data-lg": ["JetBrains Mono"],
+              "body-sm": ["Inter"],
+              "headline-lg-mobile": ["Hanken Grotesk"]
+            }
+          }
+        }
+      };
+    </script>
+    <link rel="stylesheet" href="/styles.css?v=20260701-5" />
+  </head>
+  <body class="app-body">
+    <a class="sr-only focus:not-sr-only focus:fixed focus:left-4 focus:top-4 focus:z-[100] focus:rounded-lg focus:bg-primary focus:px-4 focus:py-2 focus:text-surface" href="#main">Skip to main content</a>
+    <aside class="app-sidebar" aria-label="Primary navigation">
+      <div class="mb-10 px-4">
+        <h1 class="brand-title">PolyBot BTC</h1>
+        <p class="brand-subtitle">Paper Trading Console</p>
+      </div>
+      <div class="flex-1 space-y-2">
+        <a class="side-link" href="/">
+          <span class="material-symbols-outlined">dashboard</span>
+          Dashboard
+        </a>
+        <a class="side-link" href="/strategies.html">
+          <span class="material-symbols-outlined">precision_manufacturing</span>
+          Strategies
+        </a>
+        <a class="side-link side-link-active" href="/analytics.html" aria-current="page">
+          <span class="material-symbols-outlined">analytics</span>
+          Analytics
+        </a>
+      </div>
+      <div class="mt-auto">
+        <div class="flex items-center gap-3 px-4 pt-4 border-t border-outline-variant">
+          <div class="w-8 h-8 rounded-full bg-surface-container-highest border border-outline-variant bot-avatar" aria-hidden="true"></div>
+          <div class="flex flex-col overflow-hidden">
+            <span class="text-sm text-on-surface truncate">Operator_99</span>
+            <span class="text-[10px] text-on-surface-variant uppercase tracking-wider truncate">paper only</span>
+          </div>
+        </div>
+      </div>
+    </aside>
+
+    <main id="main" class="app-main">
+      <header class="app-topbar">
+        <div class="min-w-0">
+          <h2 class="topbar-title">Analytics</h2>
+          <div id="topbarUpdated" class="truncate text-xs font-data text-outline">Loading paper trading metrics</div>
+        </div>
+        <div class="flex items-center gap-3">
+          <span class="status-pill"><span class="status-dot dot-ok"></span>Paper Metrics</span>
+          <a aria-label="Open dashboard" class="rounded-full p-2 text-on-surface-variant transition-colors hover:bg-surface-container hover:text-primary md:hidden" href="/"><span class="material-symbols-outlined">dashboard</span></a>
+        </div>
+      </header>
+      <div class="app-content">
+        <div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-8 gap-4">
+          <div>
+            <h1 class="page-heading">Performance Analytics</h1>
+            <p id="analyticsUpdated" class="page-copy">Loading paper trading metrics</p>
+          </div>
+        </div>
+
+        <div class="grid grid-cols-1 md:grid-cols-12 gap-gutter">
+          <div class="col-span-1 md:col-span-12 grid grid-cols-2 md:grid-cols-4 gap-gutter">
+            <div class="glass-panel rounded-xl p-4 flex flex-col justify-between h-32 relative overflow-hidden group">
+              <div class="absolute inset-0 bg-gradient-to-br from-profit-emerald/10 to-transparent opacity-0 group-hover:opacity-100 transition-opacity"></div>
+              <div class="text-on-surface-variant text-sm font-medium flex items-center gap-1"><span class="material-symbols-outlined text-[16px]">show_chart</span> Settled ROI</div>
+              <div id="kpiRoi" class="font-data-lg text-2xl text-profit-emerald mt-2">--</div>
+              <div id="kpiPnl" class="text-xs text-on-surface-variant mt-1">-- PnL</div>
+            </div>
+            <div class="glass-panel rounded-xl p-4 flex flex-col justify-between h-32">
+              <div class="text-on-surface-variant text-sm font-medium flex items-center gap-1"><span class="material-symbols-outlined text-[16px]">timeline</span> Settled WR</div>
+              <div id="kpiEdge" class="font-data-lg text-2xl text-on-surface mt-2">--</div>
+              <div id="kpiConfidence" class="text-xs text-profit-emerald mt-1">-- settled trades</div>
+            </div>
+            <div class="glass-panel rounded-xl p-4 flex flex-col justify-between h-32">
+              <div class="text-on-surface-variant text-sm font-medium flex items-center gap-1"><span class="material-symbols-outlined text-[16px]">percent</span> Profit Factor</div>
+              <div id="kpiKelly" class="font-data-lg text-2xl text-warning-amber mt-2">--</div>
+              <div id="kpiEntries" class="text-xs text-on-surface-variant mt-1">-- wins / losses</div>
+            </div>
+            <div class="glass-panel rounded-xl p-4 flex flex-col justify-between h-32">
+              <div class="text-on-surface-variant text-sm font-medium flex items-center gap-1"><span class="material-symbols-outlined text-[16px]">timer</span> Decisions</div>
+              <div id="kpiDecisions" class="font-data-lg text-2xl text-on-surface mt-2">--</div>
+              <div id="kpiOrders" class="text-xs text-on-surface-variant mt-1">-- orders</div>
+            </div>
+          </div>
+
+          <div class="col-span-1 md:col-span-8 glass-panel rounded-xl p-6 relative overflow-hidden">
+            <div class="flex justify-between items-center mb-6">
+              <h2 class="text-lg font-semibold text-on-surface flex items-center gap-2"><span class="material-symbols-outlined text-btc-blue">compare_arrows</span> Timeframe Comparison</h2>
+            </div>
+            <div id="timeframeComparison" class="grid grid-cols-1 md:grid-cols-2 gap-6"></div>
+          </div>
+
+          <div class="col-span-1 md:col-span-4 glass-panel rounded-xl p-6 flex flex-col">
+            <h2 class="text-lg font-semibold text-on-surface mb-4 flex items-center gap-2"><span class="material-symbols-outlined text-btc-blue">radar</span> Decision Reasons</h2>
+            <div id="reasonRadar" class="flex-1 min-h-[200px] space-y-3"></div>
+          </div>
+
+          <div class="col-span-1 md:col-span-6 glass-panel rounded-xl p-6">
+            <h2 class="text-lg font-semibold text-on-surface mb-4 flex items-center gap-2"><span class="material-symbols-outlined text-btc-blue">bar_chart</span> Hourly Edge Distribution</h2>
+            <div id="hourlyBars" class="h-48 flex items-end justify-between gap-1 mt-4"></div>
+            <div class="flex justify-between text-[10px] text-on-surface-variant mt-2">
+              <span>00:00</span><span>06:00</span><span>12:00</span><span>18:00</span><span>24:00</span>
+            </div>
+          </div>
+
+          <div class="col-span-1 md:col-span-6 glass-panel rounded-xl p-6">
+            <h2 class="text-lg font-semibold text-on-surface mb-4 flex items-center gap-2"><span class="material-symbols-outlined text-btc-blue">grid_on</span> Trade Outcome Heatmap</h2>
+            <div id="decisionHeatmap" class="grid grid-cols-8 gap-1 mt-4"></div>
+            <div class="flex justify-between text-[10px] text-on-surface-variant mt-2">
+              <span>Older</span><span>Recent</span><span class="text-profit-emerald">Won</span><span class="text-loss-rose">Lost</span>
+            </div>
+          </div>
+
+          <div class="col-span-1 md:col-span-12 glass-panel rounded-xl p-0 overflow-hidden">
+            <div class="p-6 border-b border-white/5 flex justify-between items-center">
+              <h2 class="text-lg font-semibold text-on-surface flex items-center gap-2"><span class="material-symbols-outlined text-btc-blue">list_alt</span> Recent Paper Positions</h2>
+              <span class="text-sm text-btc-blue">SQLite backed</span>
+            </div>
+            <div class="overflow-x-auto">
+              <table class="w-full text-left text-sm">
+                <thead class="bg-surface-container-high/50 text-on-surface-variant text-[11px] uppercase">
+                  <tr>
+                    <th class="px-6 py-3 font-medium">Updated</th>
+                    <th class="px-6 py-3 font-medium">Market</th>
+                    <th class="px-6 py-3 font-medium">Side</th>
+                    <th class="px-6 py-3 font-medium">Avg</th>
+                    <th class="px-6 py-3 font-medium">Status</th>
+                    <th class="px-6 py-3 font-medium text-right">P/L</th>
+                  </tr>
+                </thead>
+                <tbody id="positionsTable" class="divide-y divide-white/5 text-on-surface"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+    </main>
+    <script src="/analytics.js?v=20260701-3"></script>
+  </body>
+</html>

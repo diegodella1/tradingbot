@@ -1,0 +1,175 @@
+<!doctype html>
+<html class="dark" lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta content="width=device-width, initial-scale=1.0" name="viewport" />
+    <meta content="#0f172a" name="theme-color" />
+    <title>PolyBot BTC - Dashboard</title>
+    <script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Hanken+Grotesk:wght@400;600;700&family=Inter:wght@400;500;700&family=JetBrains+Mono:wght@500;600&display=swap" rel="stylesheet" />
+    <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&display=swap" rel="stylesheet" />
+    <script>
+      tailwind.config = {
+        darkMode: "class",
+        theme: {
+          extend: {
+            colors: {
+              "surface-container-high": "#222a3d",
+              "surface-glass": "rgba(30, 41, 59, 0.7)",
+              outline: "#8c90a2",
+              "primary-container": "#0062ff",
+              "surface-container-low": "#131b2e",
+              primary: "#b4c5ff",
+              "surface-variant": "#2d3449",
+              "btc-blue": "#00A3FF",
+              "tertiary-container": "#d5264a",
+              "profit-emerald": "#34D399",
+              surface: "#0b1326",
+              "on-surface": "#dae2fd",
+              "on-background": "#dae2fd",
+              background: "#0b1326",
+              "warning-amber": "#F59E0B",
+              "surface-container": "#171f33",
+              "on-surface-variant": "#c2c6d9",
+              "loss-rose": "#FB7185",
+              "outline-variant": "#424656"
+            },
+            borderRadius: { DEFAULT: "0.25rem", lg: "0.5rem", xl: "0.75rem", full: "9999px" },
+            spacing: { gutter: "16px", "margin-desktop": "32px" },
+            fontFamily: {
+              headline: ["Hanken Grotesk", "sans-serif"],
+              body: ["Inter", "sans-serif"],
+              data: ["JetBrains Mono", "monospace"]
+            }
+          }
+        }
+      };
+    </script>
+    <link rel="stylesheet" href="/styles.css?v=20260701-5" />
+  </head>
+  <body class="app-body">
+    <a class="sr-only focus:not-sr-only focus:fixed focus:left-4 focus:top-4 focus:z-[100] focus:rounded-lg focus:bg-primary focus:px-4 focus:py-2 focus:text-surface" href="#main">Skip to main content</a>
+    <aside class="app-sidebar" aria-label="Primary navigation">
+      <div class="mb-10 px-4">
+        <div class="brand-title">PolyBot BTC</div>
+        <p class="brand-subtitle">Paper Trading Console</p>
+      </div>
+      <nav class="flex-1 space-y-2">
+        <a class="side-link side-link-active" href="/" aria-current="page"><span class="material-symbols-outlined" style="font-variation-settings:'FILL' 1;">dashboard</span><span>Dashboard</span></a>
+        <a class="side-link" href="/strategies.html"><span class="material-symbols-outlined">architecture</span><span>Strategies</span></a>
+        <a class="side-link" href="/analytics.html"><span class="material-symbols-outlined">analytics</span><span>Analytics</span></a>
+      </nav>
+      <div class="mt-auto space-y-4">
+        <button class="w-full rounded-lg border border-loss-rose/35 bg-loss-rose/12 px-4 py-3 text-xs font-bold uppercase tracking-wide text-loss-rose transition-colors hover:bg-loss-rose/20" type="button" title="Create KILL_SWITCH file manually on server to stop execution.">
+          <span class="material-symbols-outlined align-middle text-sm">emergency_home</span>
+          Kill Switch Manual
+        </button>
+        <div class="flex items-center gap-3 border-t border-outline-variant px-4 pt-4">
+          <div class="h-8 w-8 flex-shrink-0 rounded-full border border-outline-variant bg-surface-container-highest bot-avatar" aria-hidden="true"></div>
+          <div class="min-w-0">
+            <div class="truncate text-sm text-on-surface">Operator_99</div>
+            <div id="navStatus" class="truncate text-[10px] uppercase tracking-wider text-on-surface-variant">sync pending</div>
+          </div>
+        </div>
+      </div>
+    </aside>
+
+    <main id="main" class="app-main">
+      <header class="app-topbar">
+        <div class="min-w-0">
+          <div class="topbar-title">Dashboard</div>
+          <div id="updatedAt" class="truncate text-xs font-data text-outline">Loading...</div>
+        </div>
+        <div class="flex min-w-0 items-center gap-2 sm:gap-3">
+          <span class="status-pill"><span id="serverDot" class="status-dot"></span><span id="serverStatus">Sync</span></span>
+          <span id="modeLabel" class="status-pill hidden sm:inline-flex">Paper / Locked</span>
+          <a aria-label="Open strategies" class="rounded-full p-2 text-on-surface-variant transition-colors hover:bg-surface-container hover:text-primary md:hidden" href="/strategies.html"><span class="material-symbols-outlined">architecture</span></a>
+        </div>
+      </header>
+
+      <div class="app-content space-y-6">
+        <section class="grid grid-cols-1 gap-6 xl:grid-cols-[minmax(0,1.45fr)_minmax(320px,0.55fr)]">
+          <div class="panel relative overflow-hidden p-5 md:p-6">
+            <div class="pointer-events-none absolute inset-0 bg-gradient-to-r from-btc-blue/5 to-transparent"></div>
+            <div class="relative grid grid-cols-1 gap-5 lg:grid-cols-[minmax(220px,0.55fr)_minmax(360px,1fr)] lg:items-center">
+              <div>
+                <p class="mb-1 flex items-center gap-2 text-sm text-on-surface-variant">
+                  BTC/USD Oracle Price <span id="btcFreshDot" class="status-dot dot-warn"></span>
+                </p>
+                <h1 id="btcPrice" class="font-headline text-4xl font-bold text-on-surface md:text-5xl">--</h1>
+                <p id="btcFreshness" class="mt-1 flex items-center gap-1 text-sm text-warning-amber">
+                  <span class="material-symbols-outlined text-[16px]">sync_problem</span> Pending feed
+                </p>
+              </div>
+              <div class="flex min-h-[190px] items-center rounded-lg border border-white/5 bg-surface/20 p-2">
+                <canvas id="btcSparkline" class="block h-full min-h-[174px] w-full" aria-label="BTC one minute candles for last 20 minutes"></canvas>
+              </div>
+            </div>
+          </div>
+
+          <div class="grid grid-cols-2 gap-4">
+            <div class="panel p-4">
+              <p class="section-title mb-3"><span class="material-symbols-outlined text-[16px]">timer</span> 5m Close</p>
+              <div class="relative mx-auto h-20 w-20">
+                <svg class="circular-progress h-full w-full" viewBox="0 0 36 36" aria-hidden="true">
+                  <circle class="text-surface-variant stroke-current" cx="18" cy="18" fill="none" r="16" stroke-width="3"></circle>
+                  <circle id="progress5m" class="text-btc-blue stroke-current" cx="18" cy="18" fill="none" r="16" stroke-dasharray="100 100" stroke-dashoffset="100" stroke-linecap="round" stroke-width="3"></circle>
+                </svg>
+                <div class="absolute inset-0 flex items-center justify-center"><span id="close5m" class="font-data text-sm text-on-surface">--</span></div>
+              </div>
+            </div>
+            <div class="panel p-4">
+              <p class="section-title mb-3"><span class="material-symbols-outlined text-[16px]">timer</span> 15m Close</p>
+              <div class="relative mx-auto h-20 w-20">
+                <svg class="circular-progress h-full w-full" viewBox="0 0 36 36" aria-hidden="true">
+                  <circle class="text-surface-variant stroke-current" cx="18" cy="18" fill="none" r="16" stroke-width="3"></circle>
+                  <circle id="progress15m" class="text-secondary-container stroke-current" cx="18" cy="18" fill="none" r="16" stroke-dasharray="100 100" stroke-dashoffset="100" stroke-linecap="round" stroke-width="3"></circle>
+                </svg>
+                <div class="absolute inset-0 flex items-center justify-center"><span id="close15m" class="font-data text-sm text-on-surface">--</span></div>
+              </div>
+            </div>
+            <div class="metric-card col-span-2 min-h-0">
+              <div class="metric-label"><span class="material-symbols-outlined text-[16px] text-profit-emerald">account_balance_wallet</span> Paper Wallet</div>
+              <div id="bankrollLabel" class="metric-value">--</div>
+              <div class="metric-note">Available cash after fills, settlements and estimated Polymarket taker fees.</div>
+            </div>
+          </div>
+        </section>
+
+        <section class="grid grid-cols-2 gap-4 md:grid-cols-4 xl:grid-cols-6">
+          <div class="metric-card"><div class="metric-label"><span class="material-symbols-outlined text-[16px]">payments</span> Realized PnL</div><div id="paperPnl" class="metric-value">$0.00</div><div class="metric-note">Settled positions only</div></div>
+          <div class="metric-card"><div class="metric-label"><span class="material-symbols-outlined text-[16px]">query_stats</span> Unrealized</div><div id="unrealizedPnl" class="metric-value">$0.00</div><div class="metric-note">Open mark-to-market</div></div>
+          <div class="metric-card"><div class="metric-label"><span class="material-symbols-outlined text-[16px]">percent</span> Settled WR</div><div id="settledWinRate" class="metric-value">--</div><div id="settledTrades" class="metric-note">0 settled trades</div></div>
+          <div class="metric-card"><div class="metric-label"><span class="material-symbols-outlined text-[16px]">sync_alt</span> Volume</div><div id="paperVolume" class="metric-value">$0.00</div><div id="totalOrders" class="metric-note">0 fills</div></div>
+          <div class="metric-card"><div class="metric-label"><span class="material-symbols-outlined text-[16px]">lock_open</span> Exposure</div><div id="openExposure" class="metric-value">$0.00</div><div id="openPositionCount" class="metric-note">0 open positions</div></div>
+          <div class="metric-card">
+            <div class="metric-label"><span class="material-symbols-outlined text-[16px]">hourglass_top</span> Pending</div>
+            <div id="pendingSettlementValue" class="metric-value">$0.00</div>
+            <div id="pendingSettlementCount" class="metric-note">0 pending settlements</div>
+            <button id="forceSettlementButton" class="mt-3 inline-flex min-h-10 items-center justify-center gap-2 rounded-lg border border-warning-amber/35 bg-warning-amber/10 px-3 py-2 text-xs font-bold uppercase tracking-wide text-warning-amber transition-colors hover:bg-warning-amber/20 disabled:cursor-not-allowed disabled:opacity-50" type="button">
+              <span class="material-symbols-outlined text-[16px]">published_with_changes</span>
+              Force Settlement
+            </button>
+            <div id="settlementStatus" class="mt-2 text-xs text-outline">Uses verified Polymarket outcome prices only.</div>
+          </div>
+        </section>
+
+        <section class="grid grid-cols-1 gap-6 xl:grid-cols-[minmax(0,1.35fr)_minmax(360px,0.65fr)]">
+          <div class="space-y-4">
+            <div class="flex items-center justify-between gap-4">
+              <h2 class="section-title"><span class="material-symbols-outlined text-[16px]">bolt</span> Active Real Markets</h2>
+              <span class="text-xs text-outline">5m / 15m BTC Up-Down only</span>
+            </div>
+            <div id="activeMarkets" class="grid grid-cols-1 gap-4 lg:grid-cols-2"></div>
+          </div>
+
+          <div class="space-y-4">
+            <h2 class="section-title"><span class="material-symbols-outlined text-[16px]">work_history</span> Current Paper Positions</h2>
+            <div id="openPositions" class="panel p-4 text-sm"></div>
+          </div>
+        </section>
+      </div>
+    </main>
+    <script src="/app.js?v=20260701-11"></script>
+  </body>
+</html>
