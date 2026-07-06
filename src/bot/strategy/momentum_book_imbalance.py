@@ -38,6 +38,13 @@ class MomentumBookImbalanceStrategy(Strategy):
         if context.btc.realized_volatility > self.settings.max_realized_volatility:
             # In extreme volatility regimes the outcome is close to a coin flip.
             return Signal(action=SignalAction.HOLD, reason="volatility regime too extreme")
+        if (
+            self.settings.min_abs_change_since_open > 0
+            and abs(context.btc.change_since_open) < self.settings.min_abs_change_since_open
+        ):
+            # Tiny moves can flip on the Coinbase-vs-Chainlink divergence: the
+            # resolution oracle may sit on the other side of our proxy price.
+            return Signal(action=SignalAction.HOLD, reason="move since open too small vs oracle divergence")
 
         up = self._candidate(SignalAction.BUY_UP, context.up_book, context)
         down = self._candidate(SignalAction.BUY_DOWN, context.down_book, context)

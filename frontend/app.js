@@ -288,7 +288,7 @@ async function refresh() {
   if (state.refreshing) return;
   state.refreshing = true;
   try {
-    const response = await fetch(`/api/status?ts=${Date.now()}`, { cache: "no-store" });
+    const response = await fetch(`/api/status?ts=${Date.now()}`, { cache: "no-store", headers: authHeaders() });
     const data = await response.json();
     state.latest = data;
     const btc = data.btc?.price ? data.btc : {
@@ -343,7 +343,7 @@ async function forceSettlement() {
     const response = await fetch(`/api/settlements/force?ts=${Date.now()}`, {
       method: "POST",
       cache: "no-store",
-      headers: { "Content-Type": "application/json" },
+      headers: authHeaders({ "Content-Type": "application/json" }),
       body: "{}",
     });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);

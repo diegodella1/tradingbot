@@ -10,7 +10,14 @@ from bot.backtest.engine import (
     sample_pnl,
     summarize,
 )
-from bot.backtest.sweep import SweepCell, recommend, recommended_env_lines, run_sweep
+from bot.backtest.sweep import (
+    SweepCell,
+    recommend,
+    recommended_env_lines,
+    run_sweep,
+    run_walk_forward_sweep,
+    split_rows_by_market,
+)
 
 __all__ = [
     "BacktestSample",
@@ -24,6 +31,8 @@ __all__ = [
     "recommended_env_lines",
     "run_backtest",
     "run_sweep",
+    "run_walk_forward_sweep",
     "sample_pnl",
+    "split_rows_by_market",
     "summarize",
 ]

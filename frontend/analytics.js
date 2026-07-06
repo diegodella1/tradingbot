@@ -155,7 +155,7 @@ function renderPositions(positions) {
 }
 
 async function refreshAnalytics() {
-  const response = await fetch(`/api/analytics?ts=${Date.now()}`, { cache: "no-store" });
+  const response = await fetch(`/api/analytics?ts=${Date.now()}`, { cache: "no-store", headers: authHeaders() });
   const data = await response.json();
   $("#analyticsUpdated").textContent = `SQLite paper metrics updated ${data.generated_at}`;
   const topbar = $("#topbarUpdated");

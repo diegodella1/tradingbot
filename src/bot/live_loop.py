@@ -32,7 +32,7 @@ from bot.strategy.no_trade import NoTradeStrategy
 from bot.util.filelock import FileLock, LockAlreadyHeld
 
 # Reuse the paper-loop helpers to keep a single source of truth for shared logic.
-from bot.main import _apply_realtime_state, _market_open_price, _sync_risk_state
+from bot.main import _apply_realtime_state, _market_open_price, _sync_risk_state, _track_feed_degradation
 
 
 async def _preflight(settings: Settings) -> None:
@@ -82,7 +82,7 @@ async def run_live_loop(settings: Settings, max_cycles: int | None = None) -> No
     cycles = 0
     with connect(settings.sqlite_path) as conn:
         repo = Repository(conn)
-        risk.state = repo.hydrate_risk_state()
+        risk.state = repo.hydrate_risk_state(settings.loss_streak_window_minutes)
         try:
             while not stop.is_set():
                 cycles += 1
@@ -110,8 +110,10 @@ async def _live_cycle(settings, gamma, clob, btc_feed, broker, tracker, risk, st
     try:
         if realtime is not None and btc_feed.current_price is not None:
             btc_state = btc_feed.state
+            _track_feed_degradation(settings, repo, realtime, using_rest=False)
         else:
             btc_state = await btc_feed.poll_once()
+            _track_feed_degradation(settings, repo, realtime, using_rest=True)
         if btc_state.current_price is not None:
             repo.save_btc_tick(btc_state.current_price)
     except Exception as exc:
@@ -147,7 +149,11 @@ async def _live_cycle(settings, gamma, clob, btc_feed, broker, tracker, risk, st
             repo.save_health_event("market_feed", "blocked", f"{market.market_id}: {exc}")
             continue
 
-        market_open_price = _market_open_price(repo, market) or btc_state.market_open_price or btc_state.current_price
+        market_open_price = (
+            _market_open_price(repo, market, chainlink=realtime.chainlink if realtime else None)
+            or btc_state.market_open_price
+            or btc_state.current_price
+        )
         market_btc_state = btc_state.model_copy(update={"market_open_price": market_open_price})
         context = MarketContext(market=market, up_book=up_book, down_book=down_book, btc=market_btc_state)
         signal = strategy.evaluate(context)
@@ -166,11 +172,14 @@ async def _place_live_order(settings, broker, tracker, risk, repo, context, sign
     token = context.market.tokens.get(side)
     if token is None:
         return
+    price = _live_order_price(settings, context, side, signal)
+    if price is None:
+        return
     request = OrderRequest(
         market_id=context.market.market_id,
         token_id=token.token_id,
         side=OrderSide.BUY,
-        price=signal.max_price,
+        price=price,
         size_usdc=signal.size_usdc,
         reason=signal.reason,
     )
@@ -182,6 +191,20 @@ async def _place_live_order(settings, broker, tracker, risk, repo, context, sign
     if order.status in {OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED}:
         _record_live_fill(repo, risk, order)
     send_alert(settings, "live_order_placed", market=context.market.question, action=signal.action.value, price=request.price, size=request.size_usdc, status=order.status.value)
+
+
+def _live_order_price(settings, context, side: OutcomeSide, signal) -> float | None:
+    """Taker crosses at the signal's max price; maker joins the best bid.
+
+    Maker orders pay zero fee and earn the 20% rebate on Polymarket crypto
+    markets; the existing stale-order cancellation handles unfilled rests.
+    """
+    if settings.live_order_style != "maker":
+        return signal.max_price
+    book = context.up_book if side == OutcomeSide.UP else context.down_book
+    if book is None or book.best_bid is None:
+        return None
+    return min(book.best_bid, signal.max_price)
 
 
 def _record_live_fill(repo: Repository, risk: RiskManager, order) -> None:

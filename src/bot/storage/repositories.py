@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from bot.execution.risk_manager import RiskDecision, RiskState
 from bot.polymarket.models import FillRecord, OrderBook, OrderRecord, Signal, UpDownMarket
@@ -202,7 +202,7 @@ class Repository:
             )
         self.conn.commit()
 
-    def hydrate_risk_state(self) -> RiskState:
+    def hydrate_risk_state(self, loss_streak_window_minutes: int = 120) -> RiskState:
         state = RiskState()
         rows = self.conn.execute(
             """
@@ -232,14 +232,17 @@ class Repository:
             state.market_exposure[row["market_id"]] = state.market_exposure.get(row["market_id"], 0.0) + exposure
             state.token_exposure[row["token_id"]] = state.token_exposure.get(row["token_id"], 0.0) + exposure
             state.trades_by_market[row["market_id"]] = state.trades_by_market.get(row["market_id"], 0) + 1
-        self._apply_pnl_risk_state(state)
+        self._apply_pnl_risk_state(state, loss_streak_window_minutes)
         return state
 
-    def _apply_pnl_risk_state(self, state: RiskState) -> None:
+    def _apply_pnl_risk_state(self, state: RiskState, loss_streak_window_minutes: int = 120) -> None:
         """Populate loss-tracking fields so daily-loss/streak/cooldown gates work at runtime.
 
         Covers settled binaries (WON/LOST) and exit-closed positions (CLOSED); a loss
-        is any settled position with negative realized PnL.
+        is any settled position with negative realized PnL. The streak only counts
+        losses settled within `loss_streak_window_minutes`; without the window an old
+        losing streak would block trading forever (no new trades means nothing ever
+        resets the counter).
         """
         day_start = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
         daily = self.conn.execute(
@@ -252,14 +255,16 @@ class Repository:
         ).fetchone()
         state.daily_pnl_usdc = float(daily[0] or 0)
 
+        window_start = (datetime.now(UTC) - timedelta(minutes=loss_streak_window_minutes)).isoformat()
         recent = self.conn.execute(
             """
             SELECT realized_pnl_usdc, settled_at
             FROM positions
-            WHERE status IN ('WON', 'LOST', 'CLOSED') AND settled_at IS NOT NULL
+            WHERE status IN ('WON', 'LOST', 'CLOSED') AND settled_at IS NOT NULL AND settled_at >= ?
             ORDER BY settled_at DESC
             LIMIT 50
-            """
+            """,
+            (window_start,),
         ).fetchall()
         streak = 0
         for row in recent:

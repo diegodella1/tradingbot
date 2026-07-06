@@ -89,6 +89,40 @@ Generate deterministic learning recommendations from paper results:
 python -m bot.cli learning-report
 ```
 
+Backtest recorded signals, with out-of-sample gate sweep (model trained on the first 80% of markets, gates evaluated on the held-out 20%):
+
+```bash
+python -m bot.cli backtest --buckets --sweep
+```
+
+Train the calibrated probability model:
+
+```bash
+python -m bot.cli calibrate
+```
+
+Refetch closed markets without a verified winner (also runs automatically inside the paper loop every `OUTCOME_BACKFILL_CYCLES`):
+
+```bash
+python -m bot.cli backfill-outcomes
+```
+
+Delete market snapshots and BTC ticks older than `DATA_RETENTION_DAYS` (also runs automatically once per day inside the paper loop):
+
+```bash
+python -m bot.cli prune --vacuum
+```
+
+Compare maker (post at bid, zero fee) vs taker EV on settled paper trades:
+
+```bash
+python -m bot.cli maker-sim
+```
+
+## Dashboard auth
+
+All `/api/*` dashboard endpoints require a Bearer token. Set `DASHBOARD_TOKEN` in `.env`; without it every API call returns 403 (fail closed). Open the dashboard once with `?token=<value>` in the URL (stored in the browser) or send `Authorization: Bearer <value>`.
+
 Check wallet readiness without placing live orders:
 
 ```bash

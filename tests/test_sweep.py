@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from bot.backtest import recommend, recommended_env_lines, run_sweep
+from bot.backtest import recommend, recommended_env_lines, run_sweep, run_walk_forward_sweep, split_rows_by_market
 from bot.backtest.dataset import TrainingRow
 from bot.strategy.calibration import FEATURE_NAMES, ProbabilityModel, build_features
 
@@ -77,6 +77,43 @@ def test_recommend_requires_target_wr_and_min_trades():
     assert best is not None
     assert best.win_rate is not None and best.win_rate >= 0.70
     assert recommend(cells, target_win_rate=0.99, min_trades=20) is None
+
+
+def test_split_rows_by_market_is_chronological_and_disjoint():
+    rows = []
+    for i in range(10):
+        rows.append(_row(f"m{i}", "UP", 0.70, 1, 400, float(i)))
+        rows.append(_row(f"m{i}", "DOWN", 0.30, 0, 400, float(i)))
+    train, test = split_rows_by_market(rows, split=0.8)
+    train_markets = {row.market_id for row in train}
+    test_markets = {row.market_id for row in test}
+    assert not train_markets & test_markets
+    assert len(train_markets) == 8
+    assert len(test_markets) == 2
+    assert max(row.epoch for row in train) < min(row.epoch for row in test)
+
+
+def test_run_walk_forward_sweep_reports_both_cell_sets():
+    rows = [_row(f"m{i}", "UP", 0.70, 1 if i % 4 else 0, 400, float(i)) for i in range(50)]
+    report = run_walk_forward_sweep(
+        rows, fee_rate=0.0, min_probabilities=(0.55,), min_seconds=(45,), price_bands=((0.10, 0.90),)
+    )
+    assert report["train_markets"] == 40
+    assert report["test_markets"] == 10
+    train_cell = next(c for c in report["train_cells"] if not c.only_15m)
+    test_cell = next(c for c in report["test_cells"] if not c.only_15m)
+    assert train_cell.trades <= 40
+    assert test_cell.trades <= 10
+    # trades in test cells only come from held-out markets
+    assert train_cell.trades + test_cell.trades <= 50
+
+
+def test_run_walk_forward_sweep_needs_enough_data():
+    import pytest
+
+    rows = [_row("m1", "UP", 0.70, 1, 400, 1.0)]
+    with pytest.raises(ValueError):
+        run_walk_forward_sweep(rows, fee_rate=0.0)
 
 
 def test_recommended_env_lines_include_market_filter_when_15m_only():

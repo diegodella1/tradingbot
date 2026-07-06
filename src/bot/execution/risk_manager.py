@@ -16,6 +16,8 @@ class RiskState:
     token_exposure: dict[str, float] = field(default_factory=dict)
     trades_by_market: dict[str, int] = field(default_factory=dict)
     websocket_connected: bool = True
+    regime_healthy: bool = True
+    regime_blocked: bool = False
 
 
 @dataclass(frozen=True)
@@ -81,6 +83,8 @@ class RiskManager:
             return RiskDecision(False, "daily loss limit hit")
         if self.state.consecutive_losses >= self.settings.max_consecutive_losses:
             return RiskDecision(False, "consecutive loss limit hit")
+        if self.state.regime_blocked:
+            return RiskDecision(False, "regime stop active: rolling WR below breakeven")
         if self.state.last_loss_at and datetime.now(UTC) - self.state.last_loss_at < timedelta(seconds=self.settings.cooldown_after_loss_seconds):
             return RiskDecision(False, "loss cooldown active")
         if self.state.trades_by_market.get(context.market.market_id, 0) >= self.settings.max_trades_per_market:

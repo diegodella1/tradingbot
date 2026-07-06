@@ -34,6 +34,7 @@ class Settings(BaseSettings):
     max_spread_cents: float = 4.0
     min_orderbook_liquidity_usdc: float = 50.0
     max_consecutive_losses: int = 3
+    loss_streak_window_minutes: int = 120
     cooldown_after_loss_seconds: int = 300
     max_trades_per_market: int = 1
     min_seconds_to_close: int = 45
@@ -57,10 +58,18 @@ class Settings(BaseSettings):
     live_trade_size_usdc: float = 1.0
     live_loop_interval_seconds: float = 3.0
     alert_webhook_url: str = ""
+    dashboard_token: str = ""
+    data_retention_days: int = 7
+    outcome_backfill_cycles: int = 60
+    regime_window_trades: int = 50
+    regime_min_trades: int = 30
+    enable_regime_stop: bool = False
+    live_order_style: Literal["taker", "maker"] = "taker"
     min_edge_cents: float = 3.0
     min_confidence: float = 0.65
     min_estimated_probability: float = 0.60
     max_realized_volatility: float = 0.001
+    min_abs_change_since_open: float = 0.0
     min_entry_price: float = 0.10
     max_entry_price: float = 0.90
     min_profit_if_win_usdc: float = 0.70

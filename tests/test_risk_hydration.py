@@ -46,3 +46,32 @@ def test_hydrate_streak_resets_after_a_win(settings):
 
     assert state.consecutive_losses == 0
     assert state.last_loss_at is None
+
+
+def test_hydrate_streak_ignores_losses_outside_window(settings):
+    """Old losing streaks must expire; otherwise the bot deadlocks forever."""
+    init_db(settings.sqlite_path)
+    now = datetime.now(UTC)
+    with connect(settings.sqlite_path) as conn:
+        _insert_settled(conn, "m1", "t1", "LOST", -1.0, (now - timedelta(hours=5)).isoformat())
+        _insert_settled(conn, "m2", "t2", "LOST", -1.0, (now - timedelta(hours=4)).isoformat())
+        _insert_settled(conn, "m3", "t3", "LOST", -1.0, (now - timedelta(hours=3)).isoformat())
+        conn.commit()
+        state = Repository(conn).hydrate_risk_state(loss_streak_window_minutes=120)
+
+    assert state.consecutive_losses == 0
+    assert state.last_loss_at is None
+
+
+def test_hydrate_streak_counts_losses_inside_window(settings):
+    init_db(settings.sqlite_path)
+    now = datetime.now(UTC)
+    with connect(settings.sqlite_path) as conn:
+        _insert_settled(conn, "m1", "t1", "LOST", -1.0, (now - timedelta(hours=5)).isoformat())
+        _insert_settled(conn, "m2", "t2", "LOST", -1.0, (now - timedelta(minutes=30)).isoformat())
+        _insert_settled(conn, "m3", "t3", "LOST", -1.0, (now - timedelta(minutes=10)).isoformat())
+        conn.commit()
+        state = Repository(conn).hydrate_risk_state(loss_streak_window_minutes=120)
+
+    assert state.consecutive_losses == 2
+    assert state.last_loss_at is not None

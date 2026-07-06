@@ -177,6 +177,42 @@ def test_strategy_blocks_extreme_volatility_regime(settings, context):
     assert "volatility" in signal.reason
 
 
+def test_strategy_blocks_tiny_move_since_open(settings, context):
+    settings.enable_experimental_strategy = True
+    settings.min_abs_change_since_open = 15.0
+    context.btc.current_price = 100008  # only +8 USD vs open
+    context.btc.market_open_price = 100000
+    context.btc.momentum_15s = 0.003
+    context.btc.momentum_60s = 0.004
+
+    signal = MomentumBookImbalanceStrategy(settings).evaluate(context)
+
+    assert signal.action == SignalAction.HOLD
+    assert "oracle divergence" in signal.reason
+
+
+def test_strategy_allows_move_above_min_abs_change(settings, context):
+    settings.enable_experimental_strategy = True
+    settings.min_abs_change_since_open = 15.0
+    settings.min_edge_cents = 1
+    settings.min_net_edge_cents = 1
+    settings.min_confidence = 0.1
+    settings.kelly_fraction_multiplier = 1.0
+    settings.min_kelly_size_usdc = 0.01
+    context.up_book.asks[0].price = 0.40
+    context.up_book.bids[0].price = 0.39
+    context.up_book.asks[0].size = 1000
+    context.up_book.bids[0].size = 2000
+    context.btc.current_price = 100040  # +40 USD vs open, clears the gate
+    context.btc.market_open_price = 100000
+    context.btc.momentum_15s = 0.003
+    context.btc.momentum_60s = 0.004
+
+    signal = MomentumBookImbalanceStrategy(settings).evaluate(context)
+
+    assert signal.action == SignalAction.BUY_UP
+
+
 def test_strategy_requires_aligned_btc_momentum(settings, context):
     settings.enable_experimental_strategy = True
     settings.min_confidence = 0.1

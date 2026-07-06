@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from bot.backtest.dataset import TrainingRow
 from bot.execution.paper_broker import polymarket_taker_fee_usdc
-from bot.strategy.calibration import ProbabilityModel
+from bot.strategy.calibration import ProbabilityModel, fit_logistic
 
 DEFAULT_MIN_PROBABILITIES = (0.55, 0.60, 0.65, 0.70, 0.75)
 DEFAULT_MIN_SECONDS = (45, 180, 300, 420)
@@ -103,6 +103,49 @@ def run_sweep(
                         )
                     )
     return cells
+
+
+def split_rows_by_market(rows: list[TrainingRow], split: float = 0.8) -> tuple[list[TrainingRow], list[TrainingRow]]:
+    """Chronological train/test split at market boundaries (no market straddles both sets)."""
+    first_epoch: dict[str, float] = {}
+    for row in rows:
+        current = first_epoch.get(row.market_id)
+        if current is None or row.epoch < current:
+            first_epoch[row.market_id] = row.epoch
+    ordered_markets = sorted(first_epoch, key=lambda market_id: first_epoch[market_id])
+    cut = max(1, int(len(ordered_markets) * split))
+    train_markets = set(ordered_markets[:cut])
+    train = [row for row in rows if row.market_id in train_markets]
+    test = [row for row in rows if row.market_id not in train_markets]
+    return train, test
+
+
+def run_walk_forward_sweep(
+    rows: list[TrainingRow],
+    fee_rate: float,
+    split: float = 0.8,
+    min_probabilities: tuple[float, ...] = DEFAULT_MIN_PROBABILITIES,
+    min_seconds: tuple[int, ...] = DEFAULT_MIN_SECONDS,
+    price_bands: tuple[tuple[float, float], ...] = DEFAULT_PRICE_BANDS,
+) -> dict:
+    """Out-of-sample sweep: fit the model on the first 80% of markets, then grid-search
+    gates on BOTH sets with that model. Only the test cells are honest estimates; the
+    train cells are reported to expose the in-sample optimism per configuration.
+    """
+    train_rows, test_rows = split_rows_by_market(rows, split)
+    if not train_rows or not test_rows:
+        raise ValueError("not enough data to split train/test")
+    model = fit_logistic([row.features for row in train_rows], [row.label for row in train_rows])
+    grids = {"min_probabilities": min_probabilities, "min_seconds": min_seconds, "price_bands": price_bands}
+    return {
+        "model": model,
+        "train_rows": len(train_rows),
+        "test_rows": len(test_rows),
+        "train_markets": len({row.market_id for row in train_rows}),
+        "test_markets": len({row.market_id for row in test_rows}),
+        "train_cells": run_sweep(train_rows, model, fee_rate, **grids),
+        "test_cells": run_sweep(test_rows, model, fee_rate, **grids),
+    }
 
 
 def recommend(cells: list[SweepCell], target_win_rate: float = 0.70, min_trades: int = 20) -> SweepCell | None:

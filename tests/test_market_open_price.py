@@ -46,6 +46,60 @@ def test_open_price_falls_back_to_nearest_tick_when_started_late(settings):
     assert price == 99.0  # nearest to start, not the live price
 
 
+def test_open_price_prefers_chainlink_price_to_beat(settings):
+    import json
+
+    from bot.btc.chainlink_feed import ChainlinkBtcFeed
+
+    init_db(settings.sqlite_path)
+    start = datetime.now(UTC) - timedelta(seconds=30)
+    chainlink = ChainlinkBtcFeed()
+    for offset, value in ((-5, 99990.0), (1, 100005.0), (10, 100100.0), (29, 100200.0)):
+        chainlink.handle_message(
+            json.dumps(
+                {
+                    "topic": "crypto_prices_chainlink",
+                    "payload": {"symbol": "btc/usd", "timestamp": (start + timedelta(seconds=offset)).timestamp() * 1000, "value": value},
+                }
+            )
+        )
+    with connect(settings.sqlite_path) as conn:
+        _tick(conn, 88888.0, start + timedelta(seconds=1))  # coinbase proxy must lose
+        conn.commit()
+        repo = Repository(conn)
+        price = _market_open_price(repo, _market("m-cl", start), chainlink=chainlink)
+        source = conn.execute("SELECT source FROM market_open_prices WHERE market_id = 'm-cl'").fetchone()["source"]
+    assert price == 100005.0
+    assert source == "chainlink"
+
+
+def test_open_price_waits_for_chainlink_on_fresh_window(settings):
+    import json
+
+    from bot.btc.chainlink_feed import ChainlinkBtcFeed
+
+    init_db(settings.sqlite_path)
+    start = datetime.now(UTC) - timedelta(seconds=10)
+    chainlink = ChainlinkBtcFeed()
+    # Feed is fresh (tick 12s old) but only has ticks BEFORE the boundary.
+    chainlink.handle_message(
+        json.dumps(
+            {
+                "topic": "crypto_prices_chainlink",
+                "payload": {"symbol": "btc/usd", "timestamp": (start - timedelta(seconds=2)).timestamp() * 1000, "value": 99000.0},
+            }
+        )
+    )
+    with connect(settings.sqlite_path) as conn:
+        _tick(conn, 88888.0, start + timedelta(seconds=1))
+        conn.commit()
+        repo = Repository(conn)
+        price = _market_open_price(repo, _market("m-wait", start), chainlink=chainlink)
+        persisted = conn.execute("SELECT COUNT(*) FROM market_open_prices").fetchone()[0]
+    assert price is None  # holds off instead of persisting the proxy
+    assert persisted == 0
+
+
 def test_open_price_is_persisted_and_stable(settings):
     init_db(settings.sqlite_path)
     start = datetime.now(UTC)

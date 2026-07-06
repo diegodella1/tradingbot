@@ -274,7 +274,7 @@ function renderDecisions(decisions) {
 }
 
 async function refreshStrategies() {
-  const response = await fetch(`/api/strategies?ts=${Date.now()}`, { cache: "no-store" });
+  const response = await fetch(`/api/strategies?ts=${Date.now()}`, { cache: "no-store", headers: authHeaders() });
   const data = await response.json();
   renderRuntime(data);
   renderStrategyCards(data);

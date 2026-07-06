@@ -5,7 +5,7 @@ import sqlite3
 from datetime import UTC, datetime, timedelta
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 
@@ -43,6 +43,8 @@ class DashboardHandler(SimpleHTTPRequestHandler):
 
     def do_GET(self) -> None:
         path = urlparse(self.path).path
+        if path.startswith("/api/") and not self._authorized():
+            return
         if path == "/api/status":
             self._json(status_payload())
             return
@@ -59,6 +61,8 @@ class DashboardHandler(SimpleHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path
+        if path.startswith("/api/") and not self._authorized():
+            return
         if path == "/api/settlements/force":
             self._json(force_settlements_payload())
             return
@@ -71,11 +75,40 @@ class DashboardHandler(SimpleHTTPRequestHandler):
 
     def do_HEAD(self) -> None:
         if urlparse(self.path).path in {"/api/status", "/api/analytics", "/api/strategies", "/api/learning"}:
+            if not self._authorized():
+                return
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.end_headers()
             return
         super().do_HEAD()
+
+    def _authorized(self) -> bool:
+        """Bearer-token gate for /api/*. Fails closed when DASHBOARD_TOKEN is unset."""
+        expected = get_settings().dashboard_token
+        if not expected:
+            self._deny(403, "dashboard token not configured; set DASHBOARD_TOKEN")
+            return False
+        header = self.headers.get("Authorization", "")
+        provided = header.removeprefix("Bearer ").strip() if header.startswith("Bearer ") else ""
+        if not provided:
+            provided = self.headers.get("X-Dashboard-Token", "").strip()
+        if not provided:
+            query = parse_qs(urlparse(self.path).query)
+            provided = (query.get("token") or [""])[0].strip()
+        if provided == expected:
+            return True
+        self._deny(401, "invalid or missing dashboard token")
+        return False
+
+    def _deny(self, code: int, message: str) -> None:
+        body = json.dumps({"error": message}).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
 
     def _json(self, payload: dict) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")

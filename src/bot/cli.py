@@ -13,11 +13,11 @@ from bot.backtest import (
     recommend,
     recommended_env_lines,
     run_backtest,
-    run_sweep,
+    run_walk_forward_sweep,
 )
 from bot.config import Settings, get_settings
 from bot.knowledge.rag import index_markdown, search
-from bot.strategy.calibration import ProbabilityModel, accuracy, fit_logistic, log_loss, walk_forward
+from bot.strategy.calibration import accuracy, fit_logistic, log_loss, walk_forward
 from bot.learning.policy import generate_learning_report, persist_learning_recommendations
 from bot.live_loop import run_live_loop
 from bot.main import configure_logging, run_paper_loop
@@ -26,8 +26,7 @@ from bot.polymarket.clob import ClobClient
 from bot.polymarket.gamma import GammaClient
 from bot.polymarket.geoblock import GeoblockClient
 from bot.polymarket.models import OutcomeSide
-from bot.storage.db import init_db
-from bot.storage.db import connect
+from bot.storage.db import connect, init_db, prune_old_data
 from bot.storage.repositories import Repository
 
 
@@ -140,29 +139,44 @@ def _print_buckets(samples, settings: Settings, size: float) -> None:
 
 
 def _print_sweep(training_rows, settings: Settings, target_wr: float) -> None:
-    model = ProbabilityModel.load(settings.probability_model_path)
-    if model is None or not model.is_compatible():
-        typer.echo("sweep: no hay modelo calibrado compatible; corre `calibrate` primero")
-        raise typer.Exit(1)
     if not training_rows:
         typer.echo("sweep: no hay decisiones con outcome verificado en la base")
         raise typer.Exit(1)
-    cells = run_sweep(training_rows, model, settings.paper_taker_fee_rate)
-    ranked = sorted((cell for cell in cells if cell.trades > 0), key=lambda c: c.pnl_usdc, reverse=True)
-    typer.echo("- sweep (1 trade por mercado, fees incluidos), top 10 por PnL:")
+    try:
+        report = run_walk_forward_sweep(training_rows, settings.paper_taker_fee_rate)
+    except ValueError as exc:
+        typer.echo(f"sweep: {exc}")
+        raise typer.Exit(1) from exc
+    typer.echo(
+        f"- sweep out-of-sample: modelo entrenado con {report['train_markets']} mercados "
+        f"({report['train_rows']} filas); gates evaluados en {report['test_markets']} mercados de test"
+    )
+    train_by_key = {_cell_key(cell): cell for cell in report["train_cells"]}
+    ranked = sorted((cell for cell in report["test_cells"] if cell.trades > 0), key=lambda c: c.pnl_usdc, reverse=True)
+    typer.echo("- top 10 por PnL out-of-sample (IS = in-sample con el mismo modelo):")
     for cell in ranked[:10]:
+        train_cell = train_by_key.get(_cell_key(cell))
+        in_sample = (
+            f"IS n={train_cell.trades} WR={_fmt_pct(train_cell.win_rate)} pnl={train_cell.pnl_usdc:+.2f}"
+            if train_cell
+            else "IS --"
+        )
         typer.echo(
             f"  p>={cell.min_probability} sec>={cell.min_seconds_to_close} "
             f"banda={cell.price_band[0]}-{cell.price_band[1]} solo15m={cell.only_15m} | "
-            f"n={cell.trades} WR={_fmt_pct(cell.win_rate)} pnl={cell.pnl_usdc:+.2f}"
+            f"OOS n={cell.trades} WR={_fmt_pct(cell.win_rate)} pnl={cell.pnl_usdc:+.2f} | {in_sample}"
         )
-    best = recommend(cells, target_win_rate=target_wr)
+    best = recommend(report["test_cells"], target_win_rate=target_wr, min_trades=10)
     if best is None:
-        typer.echo(f"- sin recomendacion: ninguna celda cumple WR>={target_wr:.0%} con trades suficientes")
+        typer.echo(f"- sin recomendacion: ninguna celda cumple WR>={target_wr:.0%} out-of-sample con trades suficientes")
         return
-    typer.echo(f"- recomendado (WR={_fmt_pct(best.win_rate)}, n={best.trades}, pnl={best.pnl_usdc:+.2f}); lineas .env:")
+    typer.echo(f"- recomendado por OOS (WR={_fmt_pct(best.win_rate)}, n={best.trades}, pnl={best.pnl_usdc:+.2f}); lineas .env:")
     for line in recommended_env_lines(best):
         typer.echo(f"  {line}")
+
+
+def _cell_key(cell) -> tuple:
+    return (cell.min_probability, cell.min_seconds_to_close, cell.price_band, cell.only_15m)
 
 
 @app.command()
@@ -206,6 +220,73 @@ def calibrate(
     typer.echo(f"- weights={[round(w, 3) for w in model.weights]} bias={round(model.bias, 3)}")
     typer.echo(f"- saved model to {destination}")
     typer.echo("enable it by keeping ENABLE_EXPERIMENTAL_STRATEGY=true; the strategy loads it automatically")
+
+
+@app.command("maker-sim")
+def maker_sim(
+    fill_window: float = typer.Option(60.0, min=1.0, help="Seconds a resting maker order stays before cancel."),
+) -> None:
+    """Compare maker (post at bid, zero fee) vs taker (actual fills) EV on settled paper trades."""
+    from bot.backtest.maker import maker_vs_taker
+
+    settings = _settings()
+    with connect(settings.sqlite_path) as conn:
+        result = maker_vs_taker(conn, fill_window_seconds=fill_window)
+    if result.trades == 0:
+        typer.echo("maker-sim: no hay trades liquidados con snapshots para simular")
+        raise typer.Exit(1)
+    typer.echo(f"maker vs taker (ventana de fill={fill_window:.0f}s, {result.trades} trades liquidados)")
+    typer.echo(f"- taker real:  pnl={result.taker_pnl_usdc:+.2f} fees={result.taker_fees_usdc:.2f}")
+    typer.echo(
+        f"- maker sim:   pnl={result.maker_pnl_usdc:+.2f} fees=0.00 "
+        f"fills={result.maker_fills}/{result.trades} ({_fmt_pct(result.fill_rate)})"
+    )
+    typer.echo("- nota: el pnl maker es piso (sin rebate del 20% ni fills intra-snapshot)")
+    delta = result.maker_pnl_usdc - result.taker_pnl_usdc
+    typer.echo(f"- delta maker-taker: {delta:+.2f} USDC")
+
+
+@app.command("backfill-outcomes")
+def backfill_outcomes_cmd(limit: int = typer.Option(200, min=1, help="Max closed markets to refetch from Gamma.")) -> None:
+    """Refetch closed markets without a verified winner and settle pending positions."""
+    from bot.polymarket.backfill import backfill_outcomes
+    from bot.storage.db import refresh_settlements
+
+    settings = _settings()
+
+    async def _run() -> dict:
+        gamma = GammaClient(settings)
+        try:
+            with connect(settings.sqlite_path) as conn:
+                result = await backfill_outcomes(gamma, conn, limit=limit)
+                refresh_settlements(conn)
+            return result
+        finally:
+            await gamma.close()
+
+    result = asyncio.run(_run())
+    typer.echo(f"backfill outcomes: pending={result['pending']} refreshed={result['refreshed']} verified={result['verified']}")
+    for error in result["errors"]:
+        typer.echo(f"- error: {error}")
+
+
+@app.command()
+def prune(
+    retention_days: int | None = typer.Option(None, min=1, help="Retention window; defaults to DATA_RETENTION_DAYS."),
+    vacuum: bool = typer.Option(False, "--vacuum", help="Run VACUUM afterwards to reclaim disk space (slow, needs free space)."),
+) -> None:
+    """Delete market snapshots and BTC ticks older than the retention window."""
+    settings = _settings()
+    days = retention_days if retention_days is not None else settings.data_retention_days
+    with connect(settings.sqlite_path) as conn:
+        result = prune_old_data(conn, days)
+    typer.echo(f"prune (retention={days}d, cutoff={result['cutoff']})")
+    typer.echo(f"- market_snapshots deleted={result['market_snapshots_deleted']}")
+    typer.echo(f"- btc_ticks deleted={result['btc_ticks_deleted']}")
+    if vacuum:
+        with connect(settings.sqlite_path) as conn:
+            conn.execute("VACUUM")
+        typer.echo("- vacuum done")
 
 
 @app.command("rag-index")

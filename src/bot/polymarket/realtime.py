@@ -4,6 +4,7 @@ import asyncio
 from contextlib import suppress
 from datetime import UTC, datetime
 
+from bot.btc.chainlink_feed import ChainlinkBtcFeed
 from bot.btc.price_feed import CoinbaseBtcFeed
 from bot.config import Settings
 from bot.polymarket.models import OrderBook
@@ -41,8 +42,13 @@ class RealtimeMarketData:
     def __init__(self, settings: Settings, btc_feed: CoinbaseBtcFeed):
         self.settings = settings
         self.btc_feed = btc_feed
+        self.chainlink = ChainlinkBtcFeed()  # resolution-source oracle stream (Price to Beat)
         self.cache = BookCache()
+        # Feed-degradation tracking (used by the loops to alert on WS -> REST fallback).
+        self.rest_fallback_active = False
+        self.ever_streamed = False
         self._btc_task: asyncio.Task | None = None
+        self._chainlink_task: asyncio.Task | None = None
         self._market_ws: MarketWebSocket | None = None
         self._market_task: asyncio.Task | None = None
         self._token_ids: tuple[str, ...] = ()
@@ -50,6 +56,8 @@ class RealtimeMarketData:
     async def start(self) -> None:
         if self._btc_task is None:
             self._btc_task = asyncio.create_task(self.btc_feed.run())
+        if self._chainlink_task is None:
+            self._chainlink_task = asyncio.create_task(self.chainlink.run())
 
     async def ensure_subscription(self, token_ids: list[str]) -> None:
         wanted = tuple(sorted({token for token in token_ids if token}))
@@ -93,3 +101,10 @@ class RealtimeMarketData:
             with suppress(asyncio.CancelledError, Exception):
                 await self._btc_task
         self._btc_task = None
+        with suppress(Exception):
+            await self.chainlink.stop()
+        if self._chainlink_task is not None:
+            self._chainlink_task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await self._chainlink_task
+        self._chainlink_task = None

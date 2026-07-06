@@ -4,6 +4,7 @@ import asyncio
 import logging
 import signal
 from contextlib import suppress
+from datetime import UTC, datetime
 from pathlib import Path
 
 import structlog
@@ -13,6 +14,8 @@ from bot.config import Settings
 from bot.execution.order_manager import OrderManager
 from bot.execution.paper_broker import PaperBroker
 from bot.execution.risk_manager import RiskManager
+from bot.monitoring.alerts import send_alert
+from bot.monitoring.regime import regime_snapshot
 from bot.polymarket.clob import ClobClient
 from bot.polymarket.gamma import GammaClient, rejection_reason
 from bot.polymarket.models import MarketContext, OutcomeSide, SignalAction
@@ -85,11 +88,13 @@ async def run_paper_loop(settings: Settings, max_cycles: int | None = None) -> N
             await realtime.start()
     with connect(settings.sqlite_path) as conn:
         repo = Repository(conn)
-        risk.state = repo.hydrate_risk_state()
+        risk.state = repo.hydrate_risk_state(settings.loss_streak_window_minutes)
         try:
             while not stop.is_set():
                 cycles += 1
                 await _paper_cycle(settings, gamma, clob, btc_feed, broker, risk, strategy, repo, log, realtime)
+                if settings.outcome_backfill_cycles > 0 and cycles % settings.outcome_backfill_cycles == 0:
+                    await _run_outcome_backfill(gamma, repo, log)
                 if max_cycles is not None and cycles >= max_cycles:
                     break
                 await asyncio.sleep(settings.paper_loop_interval_seconds)
@@ -106,6 +111,24 @@ async def run_paper_loop(settings: Settings, max_cycles: int | None = None) -> N
                 lock.release()
 
 
+async def _run_outcome_backfill(gamma, repo: Repository, log) -> None:
+    """Refetch closed markets without a verified winner so settlements can complete."""
+    from bot.polymarket.backfill import backfill_outcomes
+
+    try:
+        result = await backfill_outcomes(gamma, repo.conn)
+        repo.save_health_event(
+            "outcome_backfill",
+            "ok",
+            f"pending={result['pending']} refreshed={result['refreshed']} verified={result['verified']}",
+        )
+        if result["refreshed"]:
+            log.info("outcome_backfill", **{k: v for k, v in result.items() if k != "errors"})
+    except Exception as exc:
+        repo.save_health_event("outcome_backfill", "blocked", str(exc))
+        log.warning("outcome_backfill_failed", error=str(exc))
+
+
 def _acquire_paper_loop_lock(sqlite_path: Path) -> FileLock:
     lock_path = sqlite_path.with_suffix(sqlite_path.suffix + ".paper.lock")
     try:
@@ -119,8 +142,10 @@ async def _paper_cycle(settings: Settings, gamma, clob, btc_feed, broker, risk, 
     try:
         if realtime is not None and btc_feed.current_price is not None:
             btc_state = btc_feed.state  # streamed price
+            _track_feed_degradation(settings, repo, realtime, using_rest=False)
         else:
             btc_state = await btc_feed.poll_once()  # REST fallback (or until WS warms up)
+            _track_feed_degradation(settings, repo, realtime, using_rest=True)
         if btc_state.current_price is not None:
             repo.save_btc_tick(btc_state.current_price)
     except Exception as exc:
@@ -168,7 +193,11 @@ async def _paper_cycle(settings: Settings, gamma, clob, btc_feed, broker, risk, 
             state_markets.append({"type": market_type.value, "status": "book_error", "question": market.question})
             continue
 
-        market_open_price = _market_open_price(repo, market) or btc_state.market_open_price or btc_state.current_price
+        market_open_price = (
+            _market_open_price(repo, market, chainlink=realtime.chainlink if realtime else None)
+            or btc_state.market_open_price
+            or btc_state.current_price
+        )
         market_btc_state = btc_state.model_copy(update={"market_open_price": market_open_price})
         context = MarketContext(market=market, up_book=up_book, down_book=down_book, btc=market_btc_state)
         signal = strategy.evaluate(context)
@@ -218,6 +247,28 @@ async def _paper_cycle(settings: Settings, gamma, clob, btc_feed, broker, risk, 
             "markets": state_markets,
         },
     )
+
+
+def _track_feed_degradation(settings: Settings, repo: Repository, realtime: RealtimeMarketData | None, using_rest: bool) -> None:
+    """Alert once when the BTC feed silently falls back from WebSocket to REST polling.
+
+    REST polling degrades momentum signals (one tick per cycle instead of a
+    stream). Warm-up is not degradation: nothing fires until the WS streamed
+    at least once.
+    """
+    if realtime is None:
+        return
+    if not using_rest:
+        realtime.ever_streamed = True
+        if realtime.rest_fallback_active:
+            realtime.rest_fallback_active = False
+            repo.save_health_event("btc_feed", "recovered", "websocket stream restored")
+            send_alert(settings, "btc_feed_recovered", source="websocket")
+        return
+    if realtime.ever_streamed and not realtime.rest_fallback_active:
+        realtime.rest_fallback_active = True
+        repo.save_health_event("btc_feed", "degraded", "websocket down; polling REST fallback")
+        send_alert(settings, "btc_feed_degraded", fallback="rest", websocket_connected=realtime.connected)
 
 
 async def _apply_realtime_state(realtime: RealtimeMarketData | None, discovered, risk: RiskManager) -> None:
@@ -271,25 +322,67 @@ def _maybe_exit_position(settings: Settings, market, context, strategy, broker, 
 
 def _sync_risk_state(settings: Settings, repo: Repository, risk: RiskManager) -> None:
     previous_exposure = sum(risk.state.market_exposure.values())
-    refresh_settlements(repo.conn)
-    risk.state = repo.hydrate_risk_state()
+    previous_regime_healthy = risk.state.regime_healthy
+    refresh_settlements(repo.conn, retention_days=settings.data_retention_days)
+    risk.state = repo.hydrate_risk_state(settings.loss_streak_window_minutes)
     current_exposure = sum(risk.state.market_exposure.values())
     if previous_exposure > 0 and current_exposure == 0:
         repo.save_health_event("risk_state", "synced", f"cleared stale paper exposure {previous_exposure:.2f} USDC")
+    _apply_regime_control(settings, repo, risk, previous_regime_healthy)
 
 
-def _market_open_price(repo: Repository, market) -> float | None:
+def _apply_regime_control(settings: Settings, repo: Repository, risk: RiskManager, previously_healthy: bool) -> None:
+    """Compare rolling WR vs breakeven; alert on degradation, optionally stop entries."""
+    snapshot = regime_snapshot(repo.conn, settings.regime_window_trades, settings.regime_min_trades)
+    risk.state.regime_healthy = bool(snapshot["healthy"])
+    risk.state.regime_blocked = settings.enable_regime_stop and not snapshot["healthy"]
+    if not snapshot["evaluated"]:
+        return
+    detail = (
+        f"wr={snapshot['win_rate']:.3f} breakeven={snapshot['breakeven_win_rate']:.3f} "
+        f"trades={snapshot['trades']} pnl={snapshot['rolling_pnl_usdc']:+.2f}"
+    )
+    if previously_healthy and not snapshot["healthy"]:
+        repo.save_health_event("regime", "degraded", detail)
+        send_alert(
+            settings,
+            "regime_degraded",
+            win_rate=round(snapshot["win_rate"], 3),
+            breakeven=round(snapshot["breakeven_win_rate"], 3),
+            trades=snapshot["trades"],
+            rolling_pnl_usdc=round(snapshot["rolling_pnl_usdc"], 2),
+            stop_enabled=settings.enable_regime_stop,
+        )
+    elif not previously_healthy and snapshot["healthy"]:
+        repo.save_health_event("regime", "recovered", detail)
+
+
+def _market_open_price(repo: Repository, market, chainlink=None) -> float | None:
     """Resolve a stable per-market BTC open price.
 
-    Once recorded it never drifts. If the bot started after the market opened (no
-    tick at/after start), it falls back to the tick nearest the start time instead
-    of the live price, keeping change_since_open meaningful.
+    Preference order:
+    1. Persisted value (never drifts once recorded).
+    2. Chainlink oracle boundary tick: BTC up/down markets resolve against the
+       Chainlink BTC/USD stream, whose first tick at/after the window start IS
+       the official "Price to Beat". Persisted with source="chainlink".
+    3. Coinbase tick proxy (source="tick"): first tick at/after start, else the
+       nearest tick, keeping change_since_open meaningful on late starts.
+
+    While the Chainlink feed is fresh but has not yet delivered the boundary
+    tick of a just-opened window, returns None instead of locking in the proxy.
     """
     if market.start_time is None:
         return None
     persisted = repo.get_market_open_price(market.market_id)
     if persisted is not None:
         return persisted
+    if chainlink is not None and chainlink.is_fresh():
+        price = chainlink.first_tick_at_or_after(market.start_time)
+        if price is not None:
+            repo.save_market_open_price(market.market_id, price, source="chainlink")
+            return price
+        if (datetime.now(UTC) - market.start_time).total_seconds() < 90:
+            return None  # wait for the oracle tick before persisting the proxy
     start_iso = market.start_time.isoformat()
     row = repo.conn.execute(
         "SELECT price FROM btc_ticks WHERE created_at >= ? ORDER BY created_at ASC LIMIT 1",

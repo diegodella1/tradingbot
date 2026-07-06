@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from pathlib import Path
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 
 SCHEMA = """
@@ -192,6 +192,8 @@ CREATE TABLE IF NOT EXISTS strategy_decisions (
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_market_snapshots_market_created ON market_snapshots(market_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_market_snapshots_created ON market_snapshots(created_at);
+CREATE INDEX IF NOT EXISTS idx_btc_ticks_created ON btc_ticks(created_at);
 CREATE INDEX IF NOT EXISTS idx_signals_market_created ON signals(market_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_fills_created ON fills(created_at DESC);
@@ -227,17 +229,55 @@ def init_db(path: Path) -> None:
         _settle_binary_positions(conn)
 
 
-def refresh_settlements(conn: sqlite3.Connection) -> None:
+def refresh_settlements(conn: sqlite3.Connection, retention_days: int | None = None) -> None:
     """Backfill/expire/settle positions on an existing connection.
 
     Lightweight per-cycle alternative to init_db: it skips re-running the full
     schema DDL and reconnecting, but keeps settlement (and therefore realized
     PnL / loss-streak risk state) up to date while the paper loop runs.
+
+    When `retention_days` is set, old snapshots/ticks are also pruned at most
+    once per day (bulk data grows ~228 MB/day on the production Pi otherwise).
     """
     _backfill_open_positions(conn)
     _expire_unknown_positions(conn)
     _settle_binary_positions(conn)
     conn.commit()
+    if retention_days is not None:
+        maybe_prune_old_data(conn, retention_days)
+
+
+def prune_old_data(conn: sqlite3.Connection, retention_days: int = 7) -> dict[str, int | str]:
+    """Delete bulk time-series rows older than the retention window.
+
+    Only `market_snapshots` and `btc_ticks` are pruned; decisions, fills and
+    positions are lightweight and stay forever (they feed calibration).
+    """
+    cutoff = (datetime.now(UTC) - timedelta(days=retention_days)).isoformat()
+    snapshots = conn.execute("DELETE FROM market_snapshots WHERE created_at < ?", (cutoff,)).rowcount
+    ticks = conn.execute("DELETE FROM btc_ticks WHERE created_at < ?", (cutoff,)).rowcount
+    conn.commit()
+    return {"market_snapshots_deleted": int(snapshots), "btc_ticks_deleted": int(ticks), "cutoff": cutoff}
+
+
+def maybe_prune_old_data(conn: sqlite3.Connection, retention_days: int, min_interval_hours: float = 24.0) -> dict | None:
+    """Run prune_old_data at most once per `min_interval_hours`, tracked in paper_state."""
+    now = datetime.now(UTC)
+    row = conn.execute("SELECT value_json FROM paper_state WHERE key = 'last_prune'").fetchone()
+    if row:
+        try:
+            last = datetime.fromisoformat(json.loads(row["value_json"]).get("ran_at", ""))
+            if (now - last).total_seconds() < min_interval_hours * 3600:
+                return None
+        except (ValueError, TypeError, json.JSONDecodeError):
+            pass
+    result = prune_old_data(conn, retention_days)
+    conn.execute(
+        "INSERT OR REPLACE INTO paper_state (key, value_json, updated_at) VALUES ('last_prune', ?, ?)",
+        (json.dumps({"ran_at": now.isoformat(), **result}), now.isoformat()),
+    )
+    conn.commit()
+    return result
 
 
 def force_settle_pending_positions(path: Path) -> dict[str, int]:
