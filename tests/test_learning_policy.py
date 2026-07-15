@@ -60,6 +60,22 @@ def test_learning_policy_flags_losing_price_buckets_and_duplicate_markets(settin
     assert all("suggested_config_json" in item for item in report["recommendations"])
 
 
+def test_learning_policy_reports_fee_adjusted_breakeven(settings):
+    init_db(settings.sqlite_path)
+    with connect(settings.sqlite_path) as conn:
+        for index in range(20):
+            market_id = f"m{index}"
+            _market(conn, market_id, "15m")
+            status = "WON" if index < 12 else "LOST"
+            pnl = 0.45 if status == "WON" else -1.07
+            _position(conn, market_id, status, 0.68, pnl)
+        report = generate_learning_report(conn, settings)
+
+    assert report["summary"]["breakeven_win_rate"] > 0.68
+    assert report["summary"]["win_rate_gap"] < 0
+    assert any(item["metric"] == "win_rate_vs_breakeven" for item in report["recommendations"])
+
+
 def test_learning_recommendations_can_be_persisted(settings):
     init_db(settings.sqlite_path)
     with connect(settings.sqlite_path) as conn:

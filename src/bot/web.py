@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import hmac
 import json
+import math
 import sqlite3
+import threading
+import time
+from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import urlparse
 
 import httpx
 
@@ -35,6 +40,22 @@ TABLES = (
     "discovery_rejections",
     "strategy_decisions",
 )
+STATUS_CACHE_SECONDS = 15.0
+ANALYTICS_CACHE_SECONDS = 15.0
+COUNTS_CACHE_SECONDS = 300.0
+SETTLEMENT_COOLDOWN_SECONDS = 60.0
+
+_status_lock = threading.Lock()
+_status_cache: tuple[float, str, dict] | None = None
+_analytics_lock = threading.Lock()
+_analytics_cache: tuple[float, str, dict] | None = None
+_counts_lock = threading.Lock()
+_counts_cache: tuple[float, str, dict[str, int]] | None = None
+_settlement_lock = threading.Lock()
+_settlement_running = False
+_last_settlement_completed_at: float | None = None
+_process_started_at = time.monotonic()
+API_SCHEMA_VERSION = 2
 
 
 class DashboardHandler(SimpleHTTPRequestHandler):
@@ -43,10 +64,11 @@ class DashboardHandler(SimpleHTTPRequestHandler):
 
     def do_GET(self) -> None:
         path = urlparse(self.path).path
-        if path.startswith("/api/") and not self._authorized():
-            return
         if path == "/api/status":
             self._json(status_payload())
+            return
+        if path == "/api/healthz":
+            self._json(health_payload())
             return
         if path == "/api/analytics":
             self._json(analytics_payload())
@@ -61,10 +83,8 @@ class DashboardHandler(SimpleHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path
-        if path.startswith("/api/") and not self._authorized():
-            return
         if path == "/api/settlements/force":
-            self._json(force_settlements_payload())
+            self._force_settlements()
             return
         self.send_response(404)
         self.end_headers()
@@ -74,65 +94,87 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         super().end_headers()
 
     def do_HEAD(self) -> None:
-        if urlparse(self.path).path in {"/api/status", "/api/analytics", "/api/strategies", "/api/learning"}:
-            if not self._authorized():
-                return
+        if urlparse(self.path).path in {"/api/status", "/api/healthz", "/api/analytics", "/api/strategies", "/api/learning"}:
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.end_headers()
             return
         super().do_HEAD()
 
-    def _authorized(self) -> bool:
-        """Bearer-token gate for /api/*. Fails closed when DASHBOARD_TOKEN is unset."""
-        expected = get_settings().dashboard_token
-        if not expected:
-            self._deny(403, "dashboard token not configured; set DASHBOARD_TOKEN")
-            return False
-        header = self.headers.get("Authorization", "")
-        provided = header.removeprefix("Bearer ").strip() if header.startswith("Bearer ") else ""
-        if not provided:
-            provided = self.headers.get("X-Dashboard-Token", "").strip()
-        if not provided:
-            query = parse_qs(urlparse(self.path).query)
-            provided = (query.get("token") or [""])[0].strip()
-        if provided == expected:
-            return True
-        self._deny(401, "invalid or missing dashboard token")
-        return False
+    def _force_settlements(self) -> None:
+        if not self._admin_authorized():
+            configured = bool(get_settings().dashboard_admin_token)
+            code = 401 if configured else 503
+            message = "admin authorization required" if configured else "admin token not configured"
+            self._json_error(code, message)
+            return
+        allowed, code, retry_after = _begin_settlement()
+        if not allowed:
+            message = "settlement already running" if code == 409 else "settlement cooldown active"
+            self._json_error(code, message, retry_after)
+            return
+        try:
+            self._json(force_settlements_payload())
+        finally:
+            _finish_settlement()
 
-    def _deny(self, code: int, message: str) -> None:
-        body = json.dumps({"error": message}).encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        if self.command != "HEAD":
-            self.wfile.write(body)
+    def _admin_authorized(self) -> bool:
+        expected = get_settings().dashboard_admin_token
+        if not expected:
+            return False
+        authorization = self.headers.get("Authorization", "")
+        supplied = authorization[7:] if authorization.startswith("Bearer ") else ""
+        return hmac.compare_digest(supplied, expected)
+
+    def _json_error(self, code: int, message: str, retry_after: int | None = None) -> None:
+        body = json.dumps({"error": message, "retry_after": retry_after}).encode("utf-8")
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            if retry_after is not None:
+                self.send_header("Retry-After", str(retry_after))
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            return
 
     def _json(self, payload: dict) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            return
 
     def log_message(self, format: str, *args) -> None:
         return
 
 
 def status_payload() -> dict:
-    settings = get_settings()
-    init_db(settings.sqlite_path)
-    counts = {table: 0 for table in TABLES}
+    global _status_cache
+    cache_key = str(get_settings().sqlite_path.resolve())
+    now = time.monotonic()
+    if _status_cache and _status_cache[1] == cache_key and now - _status_cache[0] < STATUS_CACHE_SECONDS:
+        return _status_cache[2]
+    with _status_lock:
+        now = time.monotonic()
+        if _status_cache and _status_cache[1] == cache_key and now - _status_cache[0] < STATUS_CACHE_SECONDS:
+            return _status_cache[2]
+        payload = _build_status_payload()
+        _status_cache = (time.monotonic(), cache_key, payload)
+        return payload
 
-    with sqlite3.connect(settings.sqlite_path) as conn:
-        conn.row_factory = sqlite3.Row
-        init_db(settings.sqlite_path)
-        for table in TABLES:
-            counts[table] = int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+
+def _build_status_payload() -> dict:
+    settings = get_settings()
+    with closing(_read_connection(settings.sqlite_path)) as conn:
+        counts = _table_counts(conn)
         latest_state = _state(conn, "paper_loop")
         activity = _recent_operations(conn)
         latest_btc = _latest_btc(conn, latest_state)
@@ -149,8 +191,9 @@ def status_payload() -> dict:
     safety = _safety_gates(settings, counts, last_health)
 
     return {
+        "schema_version": API_SCHEMA_VERSION,
+        "deploy_commit": settings.deploy_commit,
         "generated_at": datetime.now(UTC).isoformat(timespec="seconds"),
-        "sqlite_path": str(settings.sqlite_path),
         "live_trading_enabled": settings.enable_live_trading,
         "mode": "paper",
         "config": {
@@ -162,8 +205,10 @@ def status_payload() -> dict:
             "max_spread_cents": settings.max_spread_cents,
             "min_orderbook_liquidity_usdc": settings.min_orderbook_liquidity_usdc,
             "kelly_fraction_multiplier": settings.kelly_fraction_multiplier,
+            "policy_version": settings.policy_version,
+            "min_break_even_margin_cents": settings.min_break_even_margin_cents,
         },
-        "paper_state": latest_state,
+        "paper_state": _slim_paper_state(latest_state),
         "btc": latest_btc,
         "btc_candles_1m": btc_candles_1m,
         "markets": markets,
@@ -178,6 +223,96 @@ def status_payload() -> dict:
         "learning": learning,
         "decisions": decisions,
     }
+
+
+def health_payload() -> dict:
+    settings = get_settings()
+    state = {"status": "pending"}
+    updated_at = None
+    if settings.sqlite_path.exists():
+        try:
+            with closing(_read_connection(settings.sqlite_path)) as conn:
+                row = conn.execute(
+                    "SELECT value_json, updated_at FROM paper_state WHERE key = 'paper_loop'"
+                ).fetchone()
+                if row:
+                    state = json.loads(row["value_json"])
+                    updated_at = row["updated_at"]
+        except (sqlite3.Error, json.JSONDecodeError):
+            state = {"status": "invalid"}
+    freshness_seconds = None
+    if updated_at:
+        try:
+            updated = datetime.fromisoformat(str(updated_at).replace("Z", "+00:00"))
+            freshness_seconds = max(0.0, (datetime.now(UTC) - updated).total_seconds())
+        except ValueError:
+            pass
+    database_ok = settings.sqlite_path.exists()
+    return {
+        "schema_version": API_SCHEMA_VERSION,
+        "ok": database_ok and not settings.enable_live_trading,
+        "mode": "paper" if not settings.enable_live_trading else "live",
+        "deploy_commit": settings.deploy_commit,
+        "uptime_seconds": round(time.monotonic() - _process_started_at, 3),
+        "database_ok": database_ok,
+        "paper_loop_status": state.get("status", "pending"),
+        "paper_loop_updated_at": updated_at,
+        "paper_loop_freshness_seconds": freshness_seconds,
+    }
+
+
+def _slim_paper_state(state: dict) -> dict:
+    return {
+        key: state.get(key)
+        for key in ("status", "mode", "strategy", "btc")
+        if state.get(key) is not None
+    }
+
+
+def _table_counts(conn: sqlite3.Connection) -> dict[str, int]:
+    global _counts_cache
+    cache_key = str(conn.execute("PRAGMA database_list").fetchone()[2])
+    now = time.monotonic()
+    if _counts_cache and _counts_cache[1] == cache_key and now - _counts_cache[0] < COUNTS_CACHE_SECONDS:
+        return _counts_cache[2]
+    with _counts_lock:
+        now = time.monotonic()
+        if _counts_cache and _counts_cache[1] == cache_key and now - _counts_cache[0] < COUNTS_CACHE_SECONDS:
+            return _counts_cache[2]
+        counts = {table: int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]) for table in TABLES}
+        _counts_cache = (time.monotonic(), cache_key, counts)
+        return counts
+
+
+def _begin_settlement() -> tuple[bool, int | None, int | None]:
+    global _settlement_running
+    with _settlement_lock:
+        if _settlement_running:
+            return False, 409, None
+        now = time.monotonic()
+        if _last_settlement_completed_at is not None:
+            remaining = SETTLEMENT_COOLDOWN_SECONDS - (now - _last_settlement_completed_at)
+            if remaining > 0:
+                return False, 429, math.ceil(remaining)
+        _settlement_running = True
+        return True, None, None
+
+
+def _finish_settlement() -> None:
+    global _last_settlement_completed_at, _settlement_running
+    with _settlement_lock:
+        _settlement_running = False
+        _last_settlement_completed_at = time.monotonic()
+
+
+def _reset_dashboard_runtime_state() -> None:
+    global _analytics_cache, _counts_cache, _last_settlement_completed_at, _settlement_running, _status_cache
+    with _status_lock, _analytics_lock, _counts_lock, _settlement_lock:
+        _status_cache = None
+        _analytics_cache = None
+        _counts_cache = None
+        _settlement_running = False
+        _last_settlement_completed_at = None
 
 
 def force_settlements_payload() -> dict:
@@ -200,9 +335,7 @@ def force_settlements_payload() -> dict:
 
 def learning_payload() -> dict:
     settings = get_settings()
-    init_db(settings.sqlite_path)
-    with sqlite3.connect(settings.sqlite_path) as conn:
-        conn.row_factory = sqlite3.Row
+    with closing(_read_connection(settings.sqlite_path)) as conn:
         return generate_learning_report(conn, settings)
 
 
@@ -356,11 +489,25 @@ def _jsonish_list(value) -> list:
 
 
 def analytics_payload() -> dict:
+    global _analytics_cache
+    cache_key = str(get_settings().sqlite_path.resolve())
+    now = time.monotonic()
+    if _analytics_cache and _analytics_cache[1] == cache_key and now - _analytics_cache[0] < ANALYTICS_CACHE_SECONDS:
+        return _analytics_cache[2]
+    with _analytics_lock:
+        now = time.monotonic()
+        if _analytics_cache and _analytics_cache[1] == cache_key and now - _analytics_cache[0] < ANALYTICS_CACHE_SECONDS:
+            return _analytics_cache[2]
+        payload = _build_analytics_payload()
+        _analytics_cache = (time.monotonic(), cache_key, payload)
+        return payload
+
+
+def _build_analytics_payload() -> dict:
     settings = get_settings()
-    init_db(settings.sqlite_path)
-    with sqlite3.connect(settings.sqlite_path) as conn:
-        conn.row_factory = sqlite3.Row
-        performance = _performance(conn, settings)
+    with closing(_read_connection(settings.sqlite_path)) as conn:
+        positions = _paper_positions(conn)
+        performance = _performance(conn, settings, positions=positions)
         decisions = _latest_decisions(conn)
         total_volume = performance["paper_volume_usdc"]
         settled_volume = performance["settled_volume_usdc"]
@@ -390,7 +537,8 @@ def analytics_payload() -> dict:
         ]
         timeframe = _timeframe_stats(conn)
         hourly = _hourly_distribution(conn)
-        recent_positions = _analytics_positions(conn)
+        recent_positions = _analytics_positions(conn, positions=positions)
+        outcomes = _position_outcomes(conn, positions=positions)
 
     return {
         "generated_at": datetime.now(UTC).isoformat(timespec="seconds"),
@@ -408,7 +556,7 @@ def analytics_payload() -> dict:
             "pending_settlement": performance["pending_settlement_count"],
             "total_orders": performance["total_orders"],
             "total_fills": performance["total_fills"],
-            "open_positions": len([p for p in performance["positions"] if p.get("status") == "OPEN"]),
+            "open_positions": len([p for p in positions if p.get("status") == "OPEN"]),
             "avg_edge": float(edge_stats["avg_edge"] or 0),
             "avg_confidence": float(edge_stats["avg_confidence"] or 0),
             "avg_kelly": float(edge_stats["avg_kelly"] or 0),
@@ -420,19 +568,23 @@ def analytics_payload() -> dict:
         "reasons": reasons,
         "decisions": decisions,
         "positions": recent_positions,
-        "outcomes": _position_outcomes(conn),
+        "outcomes": outcomes,
     }
+
+
+def _read_connection(path: Path) -> sqlite3.Connection:
+    uri = f"{path.resolve().as_uri()}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA query_only = ON")
+    conn.execute("PRAGMA busy_timeout = 5000")
+    return conn
 
 
 def strategies_payload() -> dict:
     settings = get_settings()
-    init_db(settings.sqlite_path)
-    counts = {table: 0 for table in TABLES}
-
-    with sqlite3.connect(settings.sqlite_path) as conn:
-        conn.row_factory = sqlite3.Row
-        for table in TABLES:
-            counts[table] = int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+    with closing(_read_connection(settings.sqlite_path)) as conn:
+        counts = _table_counts(conn)
         latest_state = _state(conn, "paper_loop")
         markets = _state_markets(latest_state) or _latest_markets(conn)
         decisions = _latest_decisions(conn)
@@ -461,32 +613,66 @@ def strategies_payload() -> dict:
             "enable_experimental_strategy": settings.enable_experimental_strategy,
             "min_edge_cents": settings.min_edge_cents,
             "min_confidence": settings.min_confidence,
+            "min_estimated_probability": settings.min_estimated_probability,
             "min_entry_price": settings.min_entry_price,
+            "min_entry_price_15m": settings.min_entry_price_15m,
             "max_entry_price": settings.max_entry_price,
             "min_profit_if_win_usdc": settings.min_profit_if_win_usdc,
             "min_net_edge_cents": settings.min_net_edge_cents,
+            "min_probability_15m": settings.min_probability_15m,
+            "min_probability_5m": settings.min_probability_5m,
+            "min_net_edge_15m_cents": settings.min_net_edge_15m_cents,
+            "min_net_edge_5m_cents": settings.min_net_edge_5m_cents,
+            "enable_5m_scout": settings.enable_5m_scout,
+            "min_confidence_5m": settings.min_confidence_5m,
+            "min_book_imbalance_5m": settings.min_book_imbalance_5m,
+            "max_trade_pct_15m": settings.max_trade_pct_15m,
+            "max_trade_pct_5m": settings.max_trade_pct_5m,
+            "max_trades_per_hour": settings.max_trades_per_hour,
+            "disable_5m_after_recent_loss_usdc": settings.disable_5m_after_recent_loss_usdc,
+            "recent_5m_loss_lookback": settings.recent_5m_loss_lookback,
+            "danger_zone_min_price": settings.danger_zone_min_price,
+            "danger_zone_max_price": settings.danger_zone_max_price,
+            "danger_zone_min_probability": settings.danger_zone_min_probability,
+            "danger_zone_min_net_edge_cents": settings.danger_zone_min_net_edge_cents,
+            "high_price_min_probability": settings.high_price_min_probability,
+            "high_price_min_net_edge_cents": settings.high_price_min_net_edge_cents,
+            "size_tier_base_usdc": settings.size_tier_base_usdc,
+            "size_tier_good_usdc": settings.size_tier_good_usdc,
+            "size_tier_strong_usdc": settings.size_tier_strong_usdc,
+            "size_tier_max_usdc": settings.size_tier_max_usdc,
+            "drawdown_lookback_trades": settings.drawdown_lookback_trades,
+            "drawdown_pause_loss_usdc": settings.drawdown_pause_loss_usdc,
+            "drawdown_pause_seconds": settings.drawdown_pause_seconds,
+            "drawdown_size_multiplier": settings.drawdown_size_multiplier,
             "min_book_imbalance": settings.min_book_imbalance,
             "kelly_fraction_multiplier": settings.kelly_fraction_multiplier,
             "min_kelly_size_usdc": settings.min_kelly_size_usdc,
+            "max_token_position_usdc": settings.max_token_position_usdc,
             "max_position_usdc": settings.max_position_usdc,
             "max_market_position_usdc": settings.max_market_position_usdc,
+            "max_daily_loss_usdc": settings.max_daily_loss_usdc,
             "max_open_markets": settings.max_open_markets,
             "max_trades_per_market": settings.max_trades_per_market,
             "max_spread_cents": settings.max_spread_cents,
             "min_orderbook_liquidity_usdc": settings.min_orderbook_liquidity_usdc,
             "min_seconds_to_close": settings.min_seconds_to_close,
+            "min_seconds_to_close_5m": settings.min_seconds_to_close_5m,
+            "min_seconds_to_close_15m": settings.min_seconds_to_close_15m,
             "paper_loop_interval_seconds": settings.paper_loop_interval_seconds,
             "paper_bankroll_usdc": settings.paper_bankroll_usdc,
             "paper_trade_size_usdc": settings.paper_trade_size_usdc,
             "paper_enable_fees": settings.paper_enable_fees,
             "paper_taker_fee_rate": settings.paper_taker_fee_rate,
+            "policy_version": settings.policy_version,
+            "min_break_even_margin_cents": settings.min_break_even_margin_cents,
         },
         "runtime": {
             "status": latest_state.get("status", "pending"),
             "updated_at": latest_state.get("updated_at"),
             "last_error": latest_state.get("error"),
             "market_count": len(markets),
-            "open_positions": len([item for item in performance["positions"] if item.get("status") == "OPEN"]),
+            "open_positions": performance["open_positions_count"],
         },
         "markets": markets,
         "decisions": decisions,
@@ -593,7 +779,7 @@ def _state_markets(state: dict) -> list[dict]:
                 "up_ask": item.get("up_ask"),
                 "down_bid": item.get("down_bid"),
                 "down_ask": item.get("down_ask"),
-                "signal": item.get("signal"),
+                "signal": _slim_signal(item.get("signal")),
                 "risk": item.get("risk"),
                 "order": item.get("order"),
                 "snapshots": [
@@ -603,6 +789,41 @@ def _state_markets(state: dict) -> list[dict]:
             }
         )
     return markets
+
+
+def _slim_signal(signal: dict | None) -> dict | None:
+    if not signal:
+        return None
+    metadata = signal.get("metadata") or {}
+    metadata_keys = {
+        "policy_version",
+        "market_type",
+        "estimated_probability",
+        "probability_source",
+        "min_probability",
+        "market_price",
+        "edge",
+        "edge_cents",
+        "net_edge",
+        "net_edge_cents",
+        "min_net_edge_cents",
+        "break_even_probability_after_fees",
+        "estimated_fee_per_1",
+        "ev_usdc_per_1",
+        "kelly_fraction",
+        "recommended_size_usdc",
+        "candidate_action",
+        "spread",
+        "book_liquidity_usdc",
+    }
+    return {
+        "action": signal.get("action"),
+        "confidence": signal.get("confidence"),
+        "max_price": signal.get("max_price"),
+        "size_usdc": signal.get("size_usdc"),
+        "reason": signal.get("reason"),
+        "metadata": {key: metadata[key] for key in metadata_keys if key in metadata},
+    }
 
 
 def _end_time_from_seconds(seconds: float | int | None) -> str | None:
@@ -652,11 +873,12 @@ def _latest_markets(conn: sqlite3.Connection) -> list[dict]:
     return [latest_by_type[k] for k in ("5m", "15m") if k in latest_by_type]
 
 
-def _performance(conn: sqlite3.Connection, settings) -> dict:
+def _performance(conn: sqlite3.Connection, settings, positions: list[dict] | None = None) -> dict:
     orders = conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
     fills = conn.execute("SELECT COUNT(*), COALESCE(SUM(size_usdc), 0) FROM fills").fetchone()
     pnl = conn.execute("SELECT COALESCE(SUM(realized_usdc), 0), COALESCE(SUM(unrealized_usdc), 0) FROM pnl").fetchone()
-    positions = _paper_positions(conn)
+    if positions is None:
+        positions = _paper_positions(conn)
     open_positions = [item for item in positions if item.get("status") == "OPEN"]
     pending_settlement = [item for item in positions if item.get("status") == "EXPIRED_UNKNOWN"]
     settled_positions = [item for item in positions if item.get("status") in {"WON", "LOST"}]
@@ -700,7 +922,7 @@ def _performance(conn: sqlite3.Connection, settings) -> dict:
         "losses": len(losses),
         "win_rate": (len(wins) / len(settled_positions)) if settled_positions else None,
         "profit_factor": (gross_profit / gross_loss) if gross_loss > 0 else None,
-        "positions": positions,
+        "positions": positions[:12],
     }
 
 
@@ -755,7 +977,8 @@ def _paper_positions(conn: sqlite3.Connection) -> list[dict]:
     rows = conn.execute(
         """
         SELECT p.market_id, p.token_id, p.size_usdc AS cost_usdc, p.shares, p.fee_usdc,
-               p.avg_price, p.status, p.realized_pnl_usdc, p.settlement_outcome, p.settled_at, p.updated_at,
+               p.avg_price, p.status, p.realized_pnl_usdc, p.policy_version, p.estimated_probability,
+               p.break_even_probability, p.net_edge_cents, p.settlement_outcome, p.settled_at, p.updated_at,
                m.question, m.market_type, m.end_time
         FROM positions p
         LEFT JOIN markets m ON m.market_id = p.market_id
@@ -770,6 +993,8 @@ def _paper_positions(conn: sqlite3.Connection) -> list[dict]:
                    SUM(f.size_usdc / NULLIF(f.price, 0)) AS shares,
                    COALESCE(SUM(f.fee_usdc), 0) AS fee_usdc,
                    AVG(f.price) AS avg_price, 'OPEN' AS status, 0 AS realized_pnl_usdc,
+                   NULL AS policy_version, NULL AS estimated_probability,
+                   NULL AS break_even_probability, NULL AS net_edge_cents,
                    NULL AS settlement_outcome, NULL AS settled_at,
                    MAX(f.created_at) AS updated_at, m.question, m.market_type, m.end_time
             FROM fills f
@@ -804,6 +1029,10 @@ def _paper_positions(conn: sqlite3.Connection) -> list[dict]:
                 "current_value_usdc": current_value,
                 "unrealized_pnl_usdc": (current_value - cost - fee) if current_value is not None else 0.0,
                 "realized_pnl_usdc": float(row["realized_pnl_usdc"] or 0),
+                "policy_version": row["policy_version"],
+                "estimated_probability": row["estimated_probability"],
+                "break_even_probability": row["break_even_probability"],
+                "net_edge_cents": row["net_edge_cents"],
                 "settlement_status": _settlement_status(status),
                 "settlement_outcome": row["settlement_outcome"],
                 "settled_at": row["settled_at"],
@@ -847,7 +1076,22 @@ def _latest_token_bid(conn: sqlite3.Connection, market_id: str, token_id: str) -
 
 def _token_labels(conn: sqlite3.Connection) -> dict[str, str]:
     labels: dict[str, str] = {}
-    for row in conn.execute("SELECT raw_json FROM markets").fetchall():
+    rows = conn.execute(
+        """
+        SELECT DISTINCT m.raw_json
+        FROM markets m
+        JOIN positions p ON p.market_id = m.market_id
+        """
+    ).fetchall()
+    if not rows:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT m.raw_json
+            FROM markets m
+            JOIN fills f ON f.market_id = m.market_id
+            """
+        ).fetchall()
+    for row in rows:
         try:
             raw = json.loads(row["raw_json"] or "{}")
             outcomes = json.loads(raw.get("outcomes") or "[]")
@@ -880,10 +1124,24 @@ def _latest_learning(conn: sqlite3.Connection) -> list[dict]:
 
 
 def _latest_rejections(conn: sqlite3.Connection) -> list[dict]:
+    rollups = conn.execute(
+        """
+        SELECT NULLIF(market_type, '') AS market_type, question, slug, reason,
+               last_seen_at AS created_at, occurrences
+        FROM discovery_rejection_rollups
+        ORDER BY last_seen_at DESC
+        LIMIT 20
+        """
+    ).fetchall()
+    if rollups:
+        return [dict(row) for row in rollups]
     return [
         dict(row)
         for row in conn.execute(
-            "SELECT market_type, question, slug, reason, created_at FROM discovery_rejections ORDER BY created_at DESC LIMIT 20"
+            """
+            SELECT market_type, question, slug, reason, created_at, 1 AS occurrences
+            FROM discovery_rejections ORDER BY created_at DESC LIMIT 20
+            """
         ).fetchall()
     ]
 
@@ -894,7 +1152,8 @@ def _latest_decisions(conn: sqlite3.Connection) -> list[dict]:
         for row in conn.execute(
             """
             SELECT market_id, market_type, action, estimated_probability, market_price, edge,
-                   ev_usdc, kelly_fraction, recommended_size_usdc, confidence, reason, created_at
+                   ev_usdc, kelly_fraction, recommended_size_usdc, confidence, reason,
+                   policy_version, created_at
             FROM strategy_decisions
             ORDER BY created_at DESC
             LIMIT 12
@@ -906,16 +1165,15 @@ def _latest_decisions(conn: sqlite3.Connection) -> list[dict]:
 def _timeframe_stats(conn: sqlite3.Connection) -> list[dict]:
     rows = conn.execute(
         """
-        SELECT COALESCE(d.market_type, m.market_type) AS market_type,
+        SELECT d.market_type AS market_type,
                COUNT(d.id) AS decisions,
                AVG(d.edge) AS avg_edge,
                AVG(d.confidence) AS avg_confidence,
                AVG(d.kelly_fraction) AS avg_kelly,
                SUM(CASE WHEN d.action != 'HOLD' THEN 1 ELSE 0 END) AS entries
         FROM strategy_decisions d
-        LEFT JOIN markets m ON m.market_id = d.market_id
-        WHERE COALESCE(d.market_type, m.market_type) IN ('5m', '15m')
-        GROUP BY COALESCE(d.market_type, m.market_type)
+        WHERE d.market_type IN ('5m', '15m')
+        GROUP BY d.market_type
         """
     ).fetchall()
     stats = {row["market_type"]: dict(row) for row in rows}
@@ -1001,8 +1259,9 @@ def _hourly_distribution(conn: sqlite3.Connection) -> list[dict]:
     ]
 
 
-def _position_outcomes(conn: sqlite3.Connection) -> list[dict]:
-    positions = _paper_positions(conn)
+def _position_outcomes(conn: sqlite3.Connection, positions: list[dict] | None = None) -> list[dict]:
+    if positions is None:
+        positions = _paper_positions(conn)
     ranked = sorted(
         positions,
         key=lambda item: item.get("settled_at") or item.get("updated_at") or "",
@@ -1024,8 +1283,9 @@ def _position_outcomes(conn: sqlite3.Connection) -> list[dict]:
     ]
 
 
-def _analytics_positions(conn: sqlite3.Connection) -> list[dict]:
-    positions = _paper_positions(conn)
+def _analytics_positions(conn: sqlite3.Connection, positions: list[dict] | None = None) -> list[dict]:
+    if positions is None:
+        positions = _paper_positions(conn)
     if positions:
         return positions[:12]
     return [
@@ -1058,6 +1318,7 @@ def _last_health(conn: sqlite3.Connection, name: str) -> dict | None:
 def main() -> None:
     host = "127.0.0.1"
     port = 8888
+    init_db(get_settings().sqlite_path)
     server = ThreadingHTTPServer((host, port), DashboardHandler)
     print(f"Tradingbot frontend serving on http://{host}:{port}")
     server.serve_forever()

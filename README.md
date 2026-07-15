@@ -89,6 +89,17 @@ Generate deterministic learning recommendations from paper results:
 python -m bot.cli learning-report
 ```
 
+Register a paper policy only from persisted OOS evidence. Evidence JSON must contain `trades`, `pnl_usdc`, `roi`, `windows`, and `profitable_windows`; its SHA-256 is stored with the immutable policy:
+
+```bash
+python -m bot.cli policy-register \
+  --version btc-updown-v4 \
+  --config-json '{"market_types":["15m"]}' \
+  --evidence-file ./oos-v4.json \
+  --model-file ./probability_model.candidate.json
+python -m bot.cli policy-status --evaluate
+```
+
 Backtest recorded signals, with out-of-sample gate sweep (model trained on the first 80% of markets, gates evaluated on the held-out 20%):
 
 ```bash
@@ -119,9 +130,11 @@ Compare maker (post at bid, zero fee) vs taker EV on settled paper trades:
 python -m bot.cli maker-sim
 ```
 
-## Dashboard auth
+## Public paper dashboard
 
-All `/api/*` dashboard endpoints require a Bearer token. Set `DASHBOARD_TOKEN` in `.env`; without it every API call returns 403 (fail closed). Open the dashboard once with `?token=<value>` in the URL (stored in the browser) or send `Authorization: Bearer <value>`.
+Dashboard pages and read-only `/api/*` endpoints are public because they expose paper-trading data only. Forced settlement requires `DASHBOARD_ADMIN_TOKEN`, and is limited to one active request and one execution per minute. The browser keeps this token in session storage only.
+
+`GET /api/healthz` provides a lightweight paper-loop, database and deployed-commit check for service monitoring.
 
 Check wallet readiness without placing live orders:
 
@@ -170,6 +183,44 @@ sqlite3 bot.sqlite3 "select * from orders order by created_at desc limit 10;"
 ```
 
 Tables include `markets`, `market_snapshots`, `btc_ticks`, `signals`, `orders`, `fills`, `positions`, `pnl`, `risk_events`, and `health_events`.
+
+### Dashboard database operations
+
+- Dashboard GET endpoints are read-only. Schema initialization and settlement updates run outside request handling.
+- Status and Analytics payloads use in-process caches and single-flight generation to prevent overlapping SQLite scans.
+- Analytics indexes are applied through `schema_migrations`; verify them with `EXPLAIN QUERY PLAN` before changing queries.
+- Do not run `VACUUM` while paper trading is active. It rewrites the complete database and can cause prolonged downtime on SD storage.
+- Pre-migration backups live under `backups/` and are ignored by Git.
+
+Rollback an Analytics index migration without restoring data:
+
+```sql
+DROP INDEX IF EXISTS idx_market_snapshots_market_token_created;
+DROP INDEX IF EXISTS idx_strategy_decisions_analytics_core;
+DROP INDEX IF EXISTS idx_strategy_decisions_reason;
+DROP INDEX IF EXISTS idx_strategy_decisions_hour_edge;
+DROP INDEX IF EXISTS idx_discovery_rejections_count;
+DELETE FROM schema_migrations WHERE version LIKE '20260714_analytics_%';
+```
+
+Only restore a full SQLite backup after stopping both `tradingbot-paper.service` and `tradingbot-frontend.service`, and only when data corruption or a failed migration requires it.
+
+### Commit-pinned production
+
+Production releases are immutable Git archives selected by commit SHA. Install the systemd drop-ins once, then deploy a clean commit already published to `origin/main`:
+
+```bash
+./scripts/install_release_units.sh
+./scripts/deploy_release.sh <commit-sha>
+```
+
+Deployment runs tests, switches the `current` symlink atomically, restarts both services and verifies `/api/healthz`. A failed health check restores the prior release.
+
+Database compaction is offline and rollback-safe. It checks integrity, creates a checksummed backup, aggregates repeated telemetry, compacts a copied database, swaps it only after validation, then checks service health:
+
+```bash
+./scripts/maintenance_compact.sh
+```
 
 ## Implementation Notes
 

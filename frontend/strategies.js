@@ -124,19 +124,41 @@ function renderEngineParams(config) {
     ["Experimental Strategy", config.enable_experimental_strategy ? "Enabled" : "Disabled"],
     ["Min Edge", `${fmtNum(config.min_edge_cents, 2)}c`],
     ["Min Confidence", fmtPct(config.min_confidence)],
+    ["Min Est. Probability", fmtPct(config.min_estimated_probability)],
     ["Entry Price Band", `${fmtNum(config.min_entry_price, 2)}-${fmtNum(config.max_entry_price, 2)}`],
-    ["Min Win Profit", fmtUsd(config.min_profit_if_win_usdc)],
-    ["Min Net Edge", `${fmtNum(config.min_net_edge_cents, 2)}c`],
+    ["15m Min Entry", fmtNum(config.min_entry_price_15m, 2)],
+    ["Core 15m Min Prob", fmtPct(config.min_probability_15m)],
+    ["Scout 5m Min Prob", fmtPct(config.min_probability_5m)],
+    ["Core 15m Net Edge", `${fmtNum(config.min_net_edge_15m_cents, 2)}c`],
+    ["Scout 5m Net Edge", `${fmtNum(config.min_net_edge_5m_cents, 2)}c`],
+    ["5m Scout", config.enable_5m_scout ? "enabled" : "disabled"],
+    ["5m Scout Pause", `-${fmtUsd(config.disable_5m_after_recent_loss_usdc)} / ${config.recent_5m_loss_lookback}`],
+    ["Danger Zone", `${fmtNum(config.danger_zone_min_price, 2)}-${fmtNum(config.danger_zone_max_price, 2)}`],
+    ["Danger Min Prob", fmtPct(config.danger_zone_min_probability)],
+    ["Danger Net Edge", `${fmtNum(config.danger_zone_min_net_edge_cents, 2)}c`],
+    ["High Price Min Prob", fmtPct(config.high_price_min_probability)],
+    ["Max Trades / Hour", config.max_trades_per_hour],
+    ["Size Tiers", `${fmtUsd(config.size_tier_base_usdc)} / ${fmtUsd(config.size_tier_good_usdc)} / ${fmtUsd(config.size_tier_strong_usdc)} / ${fmtUsd(config.size_tier_max_usdc)}`],
+    ["Drawdown Brake", `${config.drawdown_lookback_trades} trades / -${fmtUsd(config.drawdown_pause_loss_usdc)} / ${fmtPct(config.drawdown_size_multiplier)}`],
+    ["15m Max Size", `${fmtPct(config.max_trade_pct_15m)} bankroll`],
+    ["5m Max Size", `${fmtPct(config.max_trade_pct_5m)} bankroll`],
+    ["Legacy Min Win Profit", fmtUsd(config.min_profit_if_win_usdc)],
+    ["Fallback Min Net Edge", `${fmtNum(config.min_net_edge_cents, 2)}c`],
     ["Min Imbalance", fmtPct(config.min_book_imbalance)],
+    ["5m Min Imbalance", fmtPct(config.min_book_imbalance_5m)],
     ["Kelly Multiplier", fmtNum(config.kelly_fraction_multiplier, 2)],
     ["Min Kelly Size", fmtUsd(config.min_kelly_size_usdc)],
+    ["Token Max Exposure", fmtUsd(config.max_token_position_usdc)],
     ["Trade Size", fmtUsd(config.paper_trade_size_usdc)],
     ["Max Position", fmtUsd(config.max_position_usdc)],
+    ["Daily Loss Stop", fmtUsd(config.max_daily_loss_usdc)],
     ["Max Open Markets", config.max_open_markets],
     ["Max Trades / Market", config.max_trades_per_market],
     ["Max Spread", `${fmtNum(config.max_spread_cents, 2)}c`],
     ["Min Liquidity", fmtUsd(config.min_orderbook_liquidity_usdc)],
     ["Min Seconds To Close", `${config.min_seconds_to_close}s`],
+    ["Min Close 5m", config.min_seconds_to_close_5m == null ? "default" : `${config.min_seconds_to_close_5m}s`],
+    ["Min Close 15m", config.min_seconds_to_close_15m == null ? "default" : `${config.min_seconds_to_close_15m}s`],
     ["Loop Interval", `${fmtNum(config.paper_loop_interval_seconds, 1)}s`]
   ];
   $("#engineParams").innerHTML = params.map(([label, value]) => `
@@ -242,6 +264,29 @@ function renderLearning(learning) {
     }).join("");
   }
 
+  const versions = learning?.policy_versions || [];
+  const versionRoot = $("#policyVersions");
+  if (versionRoot) {
+    versionRoot.innerHTML = versions.map((item) => {
+      const metrics = item.metrics || {};
+      const active = Boolean(item.is_active);
+      return `
+        <article class="bg-surface-container-low p-4 rounded-lg border ${active ? "border-profit-emerald/50" : "border-outline-variant/30"}">
+          <div class="flex items-center justify-between gap-3">
+            <strong class="text-sm text-on-surface truncate">${item.version}</strong>
+            <span class="text-[10px] uppercase font-bold ${active ? "text-profit-emerald" : "text-on-surface-variant"}">${item.status}</span>
+          </div>
+          <div class="grid grid-cols-2 gap-2 mt-3 font-data text-xs">
+            <div class="text-outline">Forward <span class="text-on-surface">${metrics.trades || 0}/200</span></div>
+            <div class="text-outline">PnL <span class="${Number(metrics.pnl_usdc || 0) >= 0 ? "text-profit-emerald" : "text-loss-rose"}">${fmtUsd(metrics.pnl_usdc || 0)}</span></div>
+            <div class="text-outline">ROI <span class="text-on-surface">${fmtPct(metrics.roi)}</span></div>
+            <div class="text-outline">Drawdown <span class="text-on-surface">${fmtPct(metrics.max_drawdown_pct)}</span></div>
+          </div>
+          <p class="text-xs text-on-surface-variant mt-3">${item.gate_reason || "Historical cohort"}</p>
+        </article>`;
+    }).join("");
+  }
+
   const refs = learning?.references || [];
   $("#learningReferences").innerHTML = refs.slice(0, 4).map((ref) => `
     <div class="bg-surface-container-low/60 p-3 rounded-lg border border-outline-variant/20">
@@ -274,7 +319,8 @@ function renderDecisions(decisions) {
 }
 
 async function refreshStrategies() {
-  const response = await fetch(`/api/strategies?ts=${Date.now()}`, { cache: "no-store", headers: authHeaders() });
+  const response = await fetch(`/api/strategies?ts=${Date.now()}`, { cache: "no-store" });
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
   const data = await response.json();
   renderRuntime(data);
   renderStrategyCards(data);
@@ -289,4 +335,4 @@ async function refreshStrategies() {
 refreshStrategies().catch((error) => {
   $("#updatedAt").textContent = `strategies error: ${error.message}`;
 });
-setInterval(refreshStrategies, 2000);
+setInterval(refreshStrategies, 5000);

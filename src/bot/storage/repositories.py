@@ -48,22 +48,52 @@ class Repository:
         self.conn.commit()
 
     def save_signal(self, market_id: str, signal: Signal) -> None:
+        metadata = signal.metadata or {}
+        if signal.action.value == "HOLD" and self._recent_duplicate(
+            "signals",
+            "market_id = ? AND action = ? AND COALESCE(reason, '') = ?",
+            (market_id, signal.action.value, signal.reason or ""),
+        ):
+            return
         self.conn.execute(
-            "INSERT INTO signals (market_id, action, confidence, max_price, size_usdc, reason, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (market_id, signal.action.value, signal.confidence, signal.max_price, signal.size_usdc, signal.reason, now_text()),
+            """
+            INSERT INTO signals (
+              market_id, action, confidence, max_price, size_usdc, reason,
+              policy_version, metadata_json, config_snapshot_json, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                market_id,
+                signal.action.value,
+                signal.confidence,
+                signal.max_price,
+                signal.size_usdc,
+                signal.reason,
+                metadata.get("policy_version"),
+                json.dumps(metadata),
+                json.dumps(metadata.get("config_snapshot")) if metadata.get("config_snapshot") is not None else None,
+                now_text(),
+            ),
         )
         self.conn.commit()
 
     def save_strategy_decision(self, market: UpDownMarket, signal: Signal) -> None:
         metadata = signal.metadata or {}
+        if signal.action.value == "HOLD" and self._recent_duplicate(
+            "strategy_decisions",
+            "market_id = ? AND action = ? AND COALESCE(reason, '') = ?",
+            (market.market_id, signal.action.value, signal.reason or ""),
+        ):
+            return
         self.conn.execute(
             """
             INSERT INTO strategy_decisions (
               market_id, market_type, action, estimated_probability, market_price, edge,
               ev_usdc, kelly_fraction, recommended_size_usdc, confidence, reason,
-              metadata_json, created_at
+              metadata_json, policy_version, config_snapshot_json, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 market.market_id,
@@ -78,6 +108,8 @@ class Repository:
                 signal.confidence,
                 signal.reason,
                 json.dumps(metadata),
+                metadata.get("policy_version"),
+                json.dumps(metadata.get("config_snapshot")) if metadata.get("config_snapshot") is not None else None,
                 now_text(),
             ),
         )
@@ -130,6 +162,12 @@ class Repository:
         return float(after["price"]) if after_gap <= before_gap else float(before["price"])
 
     def save_risk_event(self, market_id: str | None, decision: RiskDecision) -> None:
+        if not decision.approved and self._recent_duplicate(
+            "risk_events",
+            "COALESCE(market_id, '') = ? AND approved = 0 AND reason = ?",
+            (market_id or "", decision.reason),
+        ):
+            return
         self.conn.execute(
             "INSERT INTO risk_events (market_id, approved, reason, created_at) VALUES (?, ?, ?, ?)",
             (market_id, int(decision.approved), decision.reason, now_text()),
@@ -137,6 +175,12 @@ class Repository:
         self.conn.commit()
 
     def save_health_event(self, name: str, status: str, detail: str = "") -> None:
+        if self._recent_duplicate(
+            "health_events",
+            "name = ? AND status = ? AND COALESCE(detail, '') = ?",
+            (name, status, detail),
+        ):
+            return
         self.conn.execute(
             "INSERT INTO health_events (name, status, detail, created_at) VALUES (?, ?, ?, ?)",
             (name, status, detail, now_text()),
@@ -151,8 +195,16 @@ class Repository:
         self.conn.commit()
 
     def save_order(self, order: OrderRecord) -> None:
+        metadata = order.request.metadata or {}
         self.conn.execute(
-            "INSERT OR REPLACE INTO orders VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            """
+            INSERT OR REPLACE INTO orders (
+              order_id, market_id, token_id, side, status, price, size_usdc,
+              filled_size_usdc, avg_fill_price, reason, policy_version,
+              metadata_json, config_snapshot_json, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
             (
                 order.order_id,
                 order.request.market_id,
@@ -164,20 +216,44 @@ class Repository:
                 order.filled_size_usdc,
                 order.avg_fill_price,
                 order.request.reason,
+                metadata.get("policy_version"),
+                json.dumps(metadata),
+                json.dumps(metadata.get("config_snapshot")) if metadata.get("config_snapshot") is not None else None,
                 order.created_at.isoformat(),
             ),
         )
         self.conn.commit()
 
     def save_fill(self, fill: FillRecord) -> None:
+        metadata = fill.metadata or {}
         self.conn.execute(
-            "INSERT INTO fills (order_id, market_id, token_id, side, price, size_usdc, fee_usdc, pnl_usdc, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (fill.order_id, fill.market_id, fill.token_id, fill.side.value, fill.price, fill.size_usdc, fill.fee_usdc, fill.pnl_usdc, fill.created_at.isoformat()),
+            """
+            INSERT INTO fills (
+              order_id, market_id, token_id, side, price, size_usdc, fee_usdc,
+              pnl_usdc, policy_version, metadata_json, config_snapshot_json, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                fill.order_id,
+                fill.market_id,
+                fill.token_id,
+                fill.side.value,
+                fill.price,
+                fill.size_usdc,
+                fill.fee_usdc,
+                fill.pnl_usdc,
+                metadata.get("policy_version"),
+                json.dumps(metadata),
+                json.dumps(metadata.get("config_snapshot")) if metadata.get("config_snapshot") is not None else None,
+                fill.created_at.isoformat(),
+            ),
         )
         self.conn.commit()
         self.upsert_position(fill)
 
     def upsert_position(self, fill: FillRecord) -> None:
+        metadata = fill.metadata or {}
         shares = fill.size_usdc / fill.price if fill.price > 0 else 0.0
         existing = self.conn.execute(
             "SELECT id, size_usdc, shares, fee_usdc FROM positions WHERE market_id = ? AND token_id = ? AND status = 'OPEN' ORDER BY id DESC LIMIT 1",
@@ -189,16 +265,59 @@ class Repository:
             new_fee = float(existing["fee_usdc"] or 0) + fill.fee_usdc
             avg_price = new_size / new_shares if new_shares > 0 else fill.price
             self.conn.execute(
-                "UPDATE positions SET size_usdc = ?, shares = ?, fee_usdc = ?, avg_price = ?, updated_at = ? WHERE id = ?",
-                (new_size, new_shares, new_fee, avg_price, now_text(), existing["id"]),
+                """
+                UPDATE positions
+                SET size_usdc = ?, shares = ?, fee_usdc = ?, avg_price = ?,
+                    policy_version = COALESCE(?, policy_version),
+                    estimated_probability = COALESCE(?, estimated_probability),
+                    break_even_probability = COALESCE(?, break_even_probability),
+                    net_edge_cents = COALESCE(?, net_edge_cents),
+                    metadata_json = COALESCE(?, metadata_json),
+                    config_snapshot_json = COALESCE(?, config_snapshot_json),
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    new_size,
+                    new_shares,
+                    new_fee,
+                    avg_price,
+                    metadata.get("policy_version"),
+                    metadata.get("estimated_probability"),
+                    metadata.get("break_even_probability_after_fees"),
+                    metadata.get("net_edge_cents"),
+                    json.dumps(metadata) if metadata else None,
+                    json.dumps(metadata.get("config_snapshot")) if metadata.get("config_snapshot") is not None else None,
+                    now_text(),
+                    existing["id"],
+                ),
             )
         else:
             self.conn.execute(
                 """
-                INSERT INTO positions (market_id, token_id, size_usdc, avg_price, shares, fee_usdc, status, realized_pnl_usdc, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, 'OPEN', 0, ?)
+                INSERT INTO positions (
+                  market_id, token_id, size_usdc, avg_price, shares, fee_usdc,
+                  status, realized_pnl_usdc, policy_version, estimated_probability,
+                  break_even_probability, net_edge_cents, metadata_json,
+                  config_snapshot_json, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, 'OPEN', 0, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (fill.market_id, fill.token_id, fill.size_usdc, fill.price, shares, fill.fee_usdc, now_text()),
+                (
+                    fill.market_id,
+                    fill.token_id,
+                    fill.size_usdc,
+                    fill.price,
+                    shares,
+                    fill.fee_usdc,
+                    metadata.get("policy_version"),
+                    metadata.get("estimated_probability"),
+                    metadata.get("break_even_probability_after_fees"),
+                    metadata.get("net_edge_cents"),
+                    json.dumps(metadata) if metadata else None,
+                    json.dumps(metadata.get("config_snapshot")) if metadata.get("config_snapshot") is not None else None,
+                    now_text(),
+                ),
             )
         self.conn.commit()
 
@@ -232,8 +351,44 @@ class Repository:
             state.market_exposure[row["market_id"]] = state.market_exposure.get(row["market_id"], 0.0) + exposure
             state.token_exposure[row["token_id"]] = state.token_exposure.get(row["token_id"], 0.0) + exposure
             state.trades_by_market[row["market_id"]] = state.trades_by_market.get(row["market_id"], 0) + 1
+        self._apply_frequency_risk_state(state)
         self._apply_pnl_risk_state(state, loss_streak_window_minutes)
         return state
+
+    def _apply_frequency_risk_state(self, state: RiskState) -> None:
+        hour_ago = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
+        row = self.conn.execute("SELECT COUNT(*) FROM orders WHERE created_at >= ?", (hour_ago,)).fetchone()
+        state.trades_last_hour = int(row[0] or 0)
+
+        recent_5m = self.conn.execute(
+            """
+            SELECT p.realized_pnl_usdc
+            FROM positions p
+            JOIN markets m ON m.market_id = p.market_id
+            WHERE m.market_type = '5m'
+              AND p.status IN ('WON', 'LOST', 'CLOSED')
+              AND p.settled_at IS NOT NULL
+            ORDER BY p.settled_at DESC
+            LIMIT 10
+            """
+        ).fetchall()
+        state.recent_5m_settled_count = len(recent_5m)
+        state.recent_5m_pnl_usdc = sum(float(row["realized_pnl_usdc"] or 0) for row in recent_5m)
+
+        recent = self.conn.execute(
+            """
+            SELECT realized_pnl_usdc, settled_at
+            FROM positions
+            WHERE status IN ('WON', 'LOST', 'CLOSED')
+              AND settled_at IS NOT NULL
+            ORDER BY settled_at DESC
+            LIMIT ?
+            """,
+            (10,),
+        ).fetchall()
+        state.recent_settled_count = len(recent)
+        state.recent_pnl_usdc = sum(float(row["realized_pnl_usdc"] or 0) for row in recent)
+        state.last_settled_at = _parse_utc(recent[0]["settled_at"]) if recent else None
 
     def _apply_pnl_risk_state(self, state: RiskState, loss_streak_window_minutes: int = 120) -> None:
         """Populate loss-tracking fields so daily-loss/streak/cooldown gates work at runtime.
@@ -289,9 +444,29 @@ class Repository:
 
     def save_exit_fill(self, fill: FillRecord, realized_pnl_usdc: float) -> None:
         """Persist a closing SELL fill without mutating position size (see close_position)."""
+        metadata = fill.metadata or {}
         self.conn.execute(
-            "INSERT INTO fills (order_id, market_id, token_id, side, price, size_usdc, fee_usdc, pnl_usdc, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (fill.order_id, fill.market_id, fill.token_id, fill.side.value, fill.price, fill.size_usdc, fill.fee_usdc, realized_pnl_usdc, fill.created_at.isoformat()),
+            """
+            INSERT INTO fills (
+              order_id, market_id, token_id, side, price, size_usdc, fee_usdc,
+              pnl_usdc, policy_version, metadata_json, config_snapshot_json, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                fill.order_id,
+                fill.market_id,
+                fill.token_id,
+                fill.side.value,
+                fill.price,
+                fill.size_usdc,
+                fill.fee_usdc,
+                realized_pnl_usdc,
+                metadata.get("policy_version"),
+                json.dumps(metadata),
+                json.dumps(metadata.get("config_snapshot")) if metadata.get("config_snapshot") is not None else None,
+                fill.created_at.isoformat(),
+            ),
         )
         self.conn.commit()
 
@@ -304,6 +479,12 @@ class Repository:
         self.conn.commit()
 
     def save_learning_note(self, note: str, tags: str = "") -> None:
+        if self._recent_duplicate(
+            "learning_notes",
+            "note = ? AND COALESCE(tags, '') = ?",
+            (note, tags),
+        ):
+            return
         self.conn.execute(
             "INSERT INTO learning_notes (note, tags, created_at) VALUES (?, ?, ?)",
             (note, tags, now_text()),
@@ -311,8 +492,43 @@ class Repository:
         self.conn.commit()
 
     def save_discovery_rejection(self, market_type: str | None, question: str, slug: str, reason: str) -> None:
+        now = datetime.now(UTC)
+        bucket_start = now.replace(minute=0, second=0, microsecond=0).isoformat()
+        now_iso = now.isoformat()
         self.conn.execute(
-            "INSERT INTO discovery_rejections (market_type, question, slug, reason, created_at) VALUES (?, ?, ?, ?, ?)",
-            (market_type, question, slug, reason, now_text()),
+            """
+            INSERT INTO discovery_rejection_rollups (
+                market_type, question, slug, reason, bucket_start,
+                occurrences, first_seen_at, last_seen_at
+            ) VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+            ON CONFLICT(market_type, slug, reason, bucket_start) DO UPDATE SET
+                question = excluded.question,
+                occurrences = discovery_rejection_rollups.occurrences + 1,
+                last_seen_at = excluded.last_seen_at
+            """,
+            (market_type or "", question, slug, reason, bucket_start, now_iso, now_iso),
         )
         self.conn.commit()
+
+    def _recent_duplicate(
+        self,
+        table: str,
+        predicate: str,
+        parameters: tuple,
+        window_seconds: int = 60,
+    ) -> bool:
+        allowed_tables = {
+            "signals",
+            "strategy_decisions",
+            "risk_events",
+            "health_events",
+            "learning_notes",
+        }
+        if table not in allowed_tables:
+            raise ValueError(f"unsupported telemetry table: {table}")
+        cutoff = (datetime.now(UTC) - timedelta(seconds=window_seconds)).isoformat()
+        row = self.conn.execute(
+            f"SELECT 1 FROM {table} WHERE {predicate} AND created_at >= ? LIMIT 1",
+            (*parameters, cutoff),
+        ).fetchone()
+        return row is not None

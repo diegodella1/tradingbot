@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import sqlite3
 from datetime import UTC, datetime
+from pathlib import Path
 
 import typer
 
@@ -19,6 +22,14 @@ from bot.config import Settings, get_settings
 from bot.knowledge.rag import index_markdown, search
 from bot.strategy.calibration import accuracy, fit_logistic, log_loss, walk_forward
 from bot.learning.policy import generate_learning_report, persist_learning_recommendations
+from bot.learning.versions import (
+    apply_active_policy,
+    auto_promote_best_candidate,
+    ensure_baseline_policy,
+    evaluate_and_transition,
+    list_policies,
+    register_candidate,
+)
 from bot.live_loop import run_live_loop
 from bot.main import configure_logging, run_paper_loop
 from bot.monitoring.health import local_health
@@ -77,6 +88,16 @@ def discover() -> None:
 def paper(max_cycles: int | None = typer.Option(None, help="Stop after N cycles; useful for tests/smoke checks.")) -> None:
     """Run real-market paper trading. No real orders."""
     settings = _settings()
+    with connect(settings.sqlite_path) as conn:
+        active = ensure_baseline_policy(conn, settings)
+        if active:
+            evaluate_and_transition(conn, active["version"], settings)
+        auto_promote_best_candidate(conn, settings)
+        settings = apply_active_policy(settings, conn)
+        if active_policy := next((item for item in list_policies(conn) if item["is_active"]), None):
+            settings = settings.model_copy(update={"policy_version": active_policy["version"]})
+        else:
+            settings = settings.model_copy(update={"enable_experimental_strategy": False})
     try:
         asyncio.run(run_paper_loop(settings, max_cycles=max_cycles))
     except RuntimeError as exc:
@@ -414,6 +435,62 @@ def learning_report(persist: bool = typer.Option(True, help="Persist generated r
     for item in report["recommendations"]:
         typer.echo(f"  [{item['status']}] {item['scope']} / {item['metric']}: {item['recommendation']}")
         typer.echo(f"    sample={item['sample_size']} confidence={float(item['confidence']):.2f} reason={item['rationale']}")
+
+
+@app.command("policy-register")
+def policy_register(
+    version: str = typer.Option(..., help="Immutable policy version identifier."),
+    config_json: str = typer.Option(..., help="JSON object containing paper-only config overrides."),
+    evidence_file: Path = typer.Option(..., exists=True, file_okay=True, dir_okay=False, readable=True),
+    model_file: Path | None = typer.Option(None, exists=True, file_okay=True, dir_okay=False, readable=True),
+) -> None:
+    """Register an OOS-tested candidate. It can only become active in paper."""
+    settings = _settings()
+    try:
+        config = json.loads(config_json)
+        if not isinstance(config, dict):
+            raise ValueError("config-json must be an object")
+        evidence_bytes = evidence_file.read_bytes()
+        oos_metrics = json.loads(evidence_bytes)
+        if not isinstance(oos_metrics, dict):
+            raise ValueError("evidence-file must contain a JSON object")
+        model_sha256 = hashlib.sha256(model_file.read_bytes()).hexdigest() if model_file else None
+        with connect(settings.sqlite_path) as conn:
+            register_candidate(
+                conn,
+                version,
+                config,
+                oos_metrics,
+                evidence_sha256=hashlib.sha256(evidence_bytes).hexdigest(),
+                model_sha256=model_sha256,
+            )
+            decision = auto_promote_best_candidate(conn, settings)
+    except (json.JSONDecodeError, ValueError) as exc:
+        typer.echo(f"candidate rejected: {exc}")
+        raise typer.Exit(1) from exc
+    typer.echo(f"registered {version}")
+    typer.echo(f"auto-promotion: {decision.reason if decision else 'not eligible or active policy exists'}")
+
+
+@app.command("policy-status")
+def policy_status(evaluate: bool = typer.Option(False, help="Evaluate and transition the active paper policy.")) -> None:
+    settings = _settings()
+    with connect(settings.sqlite_path) as conn:
+        policies = list_policies(conn)
+        if evaluate:
+            for item in policies:
+                if item["status"] == "paper_active":
+                    evaluate_and_transition(conn, item["version"], settings)
+            auto_promote_best_candidate(conn, settings)
+            policies = list_policies(conn)
+        report = generate_learning_report(conn, settings)
+    metrics_by_version = {item["version"]: item for item in report["policy_versions"]}
+    for item in policies:
+        metrics = metrics_by_version.get(item["version"], {}).get("metrics", {})
+        typer.echo(
+            f"{item['version']} status={item['status']} trades={metrics.get('trades', 0)} "
+            f"pnl={float(metrics.get('pnl_usdc') or 0):+.2f} drawdown={_fmt_pct(metrics.get('max_drawdown_pct'))}"
+        )
 
 
 def _fmt_pct(value) -> str:

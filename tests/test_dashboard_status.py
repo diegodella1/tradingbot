@@ -3,8 +3,9 @@ from __future__ import annotations
 from datetime import UTC, datetime
 import json
 
+from bot import web
 from bot.storage.db import force_settle_pending_positions, init_db
-from bot.web import analytics_payload, force_settlements_payload, status_payload, strategies_payload, _btc_candles_1m
+from bot.web import analytics_payload, force_settlements_payload, learning_payload, status_payload, strategies_payload, _btc_candles_1m
 
 
 def test_status_payload_has_dashboard_contract(settings, monkeypatch):
@@ -207,6 +208,7 @@ def test_status_payload_settles_binary_winning_paper_position(settings, monkeypa
             "INSERT INTO fills (order_id, market_id, token_id, side, price, size_usdc, pnl_usdc, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             ("o1", "won-market", "up-token", "BUY", 0.5, 1.0, 0.0, "2026-01-01T00:00:00+00:00"),
         )
+    init_db(settings.sqlite_path)
 
     payload = status_payload()
 
@@ -236,6 +238,7 @@ def test_status_payload_settles_binary_losing_paper_position(settings, monkeypat
             "INSERT INTO fills (order_id, market_id, token_id, side, price, size_usdc, pnl_usdc, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             ("o1", "lost-market", "up-token", "BUY", 0.5, 1.0, 0.0, "2026-01-01T00:00:00+00:00"),
         )
+    init_db(settings.sqlite_path)
 
     payload = status_payload()
 
@@ -357,9 +360,93 @@ def test_analytics_payload_exposes_factual_outcomes(settings, monkeypatch):
             "INSERT INTO fills (order_id, market_id, token_id, side, price, size_usdc, fee_usdc, pnl_usdc, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             ("o1", "won-market", "up-token", "BUY", 0.5, 1.0, 0.035, 0.0, "2026-01-01T00:00:00+00:00"),
         )
+    init_db(settings.sqlite_path)
 
     payload = analytics_payload()
 
     assert payload["outcomes"][0]["status"] == "WON"
     assert payload["outcomes"][0]["fee_usdc"] == 0.035
     assert "paper_wallet" in payload["kpis"]
+
+
+def test_analytics_payload_loads_positions_once(settings, monkeypatch):
+    monkeypatch.chdir(settings.sqlite_path.parent)
+    init_db(settings.sqlite_path)
+    web._reset_dashboard_runtime_state()
+    calls = 0
+    original = web._paper_positions
+
+    def counted(conn):
+        nonlocal calls
+        calls += 1
+        return original(conn)
+
+    monkeypatch.setattr(web, "_paper_positions", counted)
+
+    web.analytics_payload()
+
+    assert calls == 1
+
+
+def test_snapshot_lookup_migration_uses_covering_index(settings):
+    init_db(settings.sqlite_path)
+    with __import__("sqlite3").connect(settings.sqlite_path) as conn:
+        migration = conn.execute(
+            "SELECT name FROM schema_migrations WHERE version = ?",
+            ("20260714_analytics_snapshot_lookup",),
+        ).fetchone()
+        plan = conn.execute(
+            """
+            EXPLAIN QUERY PLAN
+            SELECT best_bid FROM market_snapshots
+            WHERE market_id = ? AND token_id = ? AND best_bid IS NOT NULL
+            ORDER BY created_at DESC LIMIT 1
+            """,
+            ("market", "token"),
+        ).fetchall()
+
+    assert migration == ("analytics snapshot lookup index",)
+    assert any("idx_market_snapshots_market_token_created" in row[3] for row in plan)
+
+
+def test_analytics_aggregate_migrations_create_covering_indexes(settings):
+    init_db(settings.sqlite_path)
+    with __import__("sqlite3").connect(settings.sqlite_path) as conn:
+        migrations = {
+            row[0]
+            for row in conn.execute(
+                "SELECT version FROM schema_migrations WHERE version LIKE ?",
+                ("20260714_analytics_%",),
+            ).fetchall()
+        }
+        indexes = {row[1] for row in conn.execute("PRAGMA index_list(strategy_decisions)").fetchall()}
+        indexes.update(row[1] for row in conn.execute("PRAGMA index_list(discovery_rejections)").fetchall())
+
+    assert {
+        "20260714_analytics_decision_core",
+        "20260714_analytics_decision_reason",
+        "20260714_analytics_decision_hour",
+        "20260714_analytics_rejection_count",
+    } <= migrations
+    assert {
+        "idx_strategy_decisions_analytics_core",
+        "idx_strategy_decisions_reason",
+        "idx_strategy_decisions_hour_edge",
+        "idx_discovery_rejections_count",
+    } <= indexes
+
+
+def test_dashboard_get_payloads_are_read_only(settings, monkeypatch):
+    monkeypatch.chdir(settings.sqlite_path.parent)
+    init_db(settings.sqlite_path)
+    web._reset_dashboard_runtime_state()
+
+    def unexpected_init(_path):
+        raise AssertionError("GET payload must not initialize or mutate the database")
+
+    monkeypatch.setattr(web, "init_db", unexpected_init)
+
+    assert status_payload()["mode"] == "paper"
+    assert analytics_payload()["kpis"]["decision_count"] == 0
+    assert strategies_payload()["mode"] == "paper"
+    assert "summary" in learning_payload()

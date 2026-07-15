@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 
 from bot.config import Settings
 from bot.knowledge.rag import search
+from bot.learning.versions import evaluate_policy, list_policies, policy_metrics
 
 
 MIN_TOTAL_SETTLEMENTS = 20
@@ -38,8 +39,10 @@ def generate_learning_report(conn: sqlite3.Connection, settings: Settings) -> di
     timeframe = [_summary([row for row in settled if row["market_type"] == market_type], market_type) for market_type in ("5m", "15m")]
     price_buckets = [_price_bucket_summary(settled, low, high) for low, high in ((0.0, 0.25), (0.25, 0.50), (0.50, 0.65), (0.65, 1.01))]
     side = [_summary([row for row in settled if row["side"] == outcome], outcome) for outcome in ("UP", "DOWN", "UNKNOWN")]
+    calibration = _calibration_buckets(settled)
     duplicates = _duplicate_market_entries(conn)
     risk_state = _risk_state_summary(conn)
+    versions = _version_summary(conn, settings)
     recommendations = _recommendations(total, timeframe, price_buckets, side, duplicates, decisions, settings)
     if risk_state["stale_block_count"] > 0 and risk_state["open_positions"] == 0:
         recommendations.insert(
@@ -68,12 +71,53 @@ def generate_learning_report(conn: sqlite3.Connection, settings: Settings) -> di
         "timeframe": timeframe,
         "price_buckets": price_buckets,
         "side": [item for item in side if item["sample_size"] > 0],
+        "calibration": calibration,
         "duplicates": duplicates,
         "risk_state": risk_state,
+        "policy_versions": versions,
         "decision_summary": decisions,
         "recommendations": [item.model_dump() for item in recommendations] if settings.enable_learning_recommendations else [],
         "references": references,
     }
+
+
+def _version_summary(conn: sqlite3.Connection, settings: Settings) -> list[dict]:
+    registered = {item["version"]: item for item in list_policies(conn)}
+    names = [
+        row[0]
+        for row in conn.execute(
+            "SELECT DISTINCT COALESCE(policy_version, 'legacy') FROM positions WHERE status IN ('WON', 'LOST')"
+        ).fetchall()
+    ]
+    output = []
+    for version in sorted(set(names) | set(registered)):
+        rows = conn.execute(
+            """
+            SELECT status, size_usdc, avg_price, fee_usdc, realized_pnl_usdc,
+                   COALESCE(break_even_probability, avg_price * (1 + fee_usdc / NULLIF(size_usdc, 0))) AS break_even
+            FROM positions
+            WHERE COALESCE(policy_version, 'legacy') = ? AND status IN ('WON', 'LOST')
+            ORDER BY settled_at, id
+            """,
+            (version,),
+        ).fetchall()
+        metrics = policy_metrics(rows, settings.paper_bankroll_usdc)
+        item = registered.get(version)
+        status = item["status"] if item else "historical"
+        gate_reason = None
+        if item:
+            decision = evaluate_policy(conn, version, settings)
+            gate_reason = decision.reason
+        output.append(
+            {
+                "version": version,
+                "status": status,
+                "is_active": bool(item and item["is_active"]),
+                "metrics": metrics,
+                "gate_reason": gate_reason,
+            }
+        )
+    return sorted(output, key=lambda item: (not item["is_active"], item["version"]))
 
 
 def persist_learning_recommendations(conn: sqlite3.Connection, recommendations: list[dict]) -> int:
@@ -110,6 +154,7 @@ def _settled_positions(conn: sqlite3.Connection) -> list[dict]:
         """
         SELECT p.market_id, p.token_id, p.status, p.size_usdc, p.avg_price, p.shares,
                COALESCE(p.fee_usdc, 0) AS fee_usdc, COALESCE(p.realized_pnl_usdc, 0) AS realized_pnl_usdc,
+               p.policy_version, p.estimated_probability, p.break_even_probability, p.net_edge_cents,
                m.market_type, m.question, m.raw_json
         FROM positions p
         LEFT JOIN markets m ON m.market_id = p.market_id
@@ -164,21 +209,42 @@ def _summary(rows: list[dict], label: str = "all") -> dict:
     wins = sum(1 for row in rows if row["status"] == "WON")
     losses = sum(1 for row in rows if row["status"] == "LOST")
     avg_price = sum(float(row["avg_price"] or 0) for row in rows) / sample_size if sample_size else None
+    break_evens = [value for row in rows if (value := _break_even_probability(row)) is not None]
+    avg_break_even = sum(break_evens) / len(break_evens) if break_evens else None
     gross_profit = sum(max(0.0, float(row["realized_pnl_usdc"] or 0)) for row in rows)
     gross_loss = abs(sum(min(0.0, float(row["realized_pnl_usdc"] or 0)) for row in rows))
+    avg_win = gross_profit / wins if wins else None
+    avg_loss = gross_loss / losses if losses else None
+    win_rate = wins / sample_size if sample_size else None
     return {
         "label": label,
         "sample_size": sample_size,
         "wins": wins,
         "losses": losses,
-        "win_rate": wins / sample_size if sample_size else None,
+        "win_rate": win_rate,
+        "breakeven_win_rate": avg_break_even,
+        "win_rate_gap": (win_rate - avg_break_even) if win_rate is not None and avg_break_even is not None else None,
         "volume_usdc": volume,
         "pnl_usdc": pnl,
         "roi": pnl / volume if volume else None,
         "fees_usdc": fees,
         "avg_entry_price": avg_price,
+        "avg_win_usdc": avg_win,
+        "avg_loss_usdc": avg_loss,
         "profit_factor": gross_profit / gross_loss if gross_loss > 0 else None,
     }
+
+
+def _break_even_probability(row: dict) -> float | None:
+    stored = row.get("break_even_probability")
+    if stored is not None:
+        return max(0.0, min(1.0, float(stored)))
+    price = float(row["avg_price"] or 0)
+    size = float(row["size_usdc"] or 0)
+    fee = float(row["fee_usdc"] or 0)
+    if price <= 0 or size <= 0:
+        return None
+    return max(0.0, min(1.0, price * (1 + (fee / size))))
 
 
 def _price_bucket_summary(rows: list[sqlite3.Row], low: float, high: float) -> dict:
@@ -187,6 +253,49 @@ def _price_bucket_summary(rows: list[sqlite3.Row], low: float, high: float) -> d
     data["low"] = low
     data["high"] = high
     return data
+
+
+def _calibration_buckets(rows: list[dict]) -> list[dict]:
+    buckets = [(0.5, 0.6), (0.6, 0.7), (0.7, 0.8), (0.8, 0.9), (0.9, 1.01)]
+    output = []
+    for low, high in buckets:
+        bucket = [
+            row
+            for row in rows
+            if row.get("estimated_probability") is not None
+            and low <= float(row["estimated_probability"]) < high
+        ]
+        summary = _summary(bucket, f"{low:.1f}-{high:.1f}")
+        predicted = (
+            sum(float(row["estimated_probability"]) for row in bucket) / len(bucket)
+            if bucket
+            else None
+        )
+        actual = summary["win_rate"]
+        breakeven = summary["breakeven_win_rate"]
+        roi = summary["roi"]
+        status = "observe"
+        if len(bucket) >= MIN_SEGMENT_SETTLEMENTS and roi is not None and breakeven is not None and actual is not None:
+            if roi > 0 and actual >= breakeven:
+                status = "tradable"
+            elif roi < 0 or actual < breakeven:
+                status = "blocked"
+        output.append(
+            {
+                "bucket": summary["label"],
+                "low": low,
+                "high": high,
+                "sample_size": summary["sample_size"],
+                "predicted_probability": predicted,
+                "actual_win_rate": actual,
+                "breakeven_win_rate": breakeven,
+                "win_rate_gap": summary["win_rate_gap"],
+                "roi": roi,
+                "pnl_usdc": summary["pnl_usdc"],
+                "status": status,
+            }
+        )
+    return output
 
 
 def _duplicate_market_entries(conn: sqlite3.Connection) -> dict:
@@ -298,6 +407,20 @@ def _recommendations(
                 confidence=_confidence(total_n),
                 sample_size=total_n,
                 suggested_config={"paper_trade_size_usdc": settings.paper_trade_size_usdc},
+            )
+        )
+
+    if total.get("win_rate_gap") is not None and float(total["win_rate_gap"]) < 0:
+        recs.append(
+            LearningRecommendation(
+                status="ready_to_apply" if total_n >= 50 else "candidate",
+                scope="global",
+                metric="win_rate_vs_breakeven",
+                recommendation="Trade only buckets whose realized win rate beats fee-adjusted break-even.",
+                rationale=f"Win rate gap is {total['win_rate_gap']:.1%}; WR {total['win_rate']:.1%} vs breakeven {total['breakeven_win_rate']:.1%}.",
+                confidence=_confidence(total_n),
+                sample_size=total_n,
+                suggested_config={"min_break_even_margin_cents": max(settings.min_break_even_margin_cents, 2.0)},
             )
         )
 

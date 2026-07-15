@@ -25,6 +25,11 @@ const fmtCents = (value) => {
   return `${(Number(value) * 100).toFixed(2)}c`;
 };
 
+const setText = (selector, value) => {
+  const node = $(selector);
+  if (node) node.textContent = value;
+};
+
 const escapeHtml = (value) => String(value ?? "")
   .replaceAll("&", "&amp;")
   .replaceAll("<", "&lt;")
@@ -180,6 +185,7 @@ function renderMarkets(markets, rejections = []) {
     const edge = Number(meta.edge ?? market.signal?.edge);
     const netEdge = Number(meta.net_edge ?? meta.edge ?? market.signal?.edge);
     const probability = meta.estimated_probability;
+    const breakEven = meta.break_even_probability_after_fees;
     const price = meta.market_price;
     const kelly = meta.kelly_fraction;
     const size = market.signal?.size_usdc ?? meta.recommended_size_usdc;
@@ -203,6 +209,7 @@ function renderMarkets(markets, rejections = []) {
             <div class="data-cell"><div class="data-cell-label">UP bid / ask</div><div class="data-cell-value text-profit-emerald">${fmtNum(up.best_bid)} / ${fmtNum(up.best_ask)}</div></div>
             <div class="data-cell"><div class="data-cell-label">DOWN bid / ask</div><div class="data-cell-value text-loss-rose">${fmtNum(down.best_bid)} / ${fmtNum(down.best_ask)}</div></div>
             <div class="data-cell"><div class="data-cell-label">Win Probability</div><div class="data-cell-value">${fmtPct(probability)}</div></div>
+            <div class="data-cell"><div class="data-cell-label">Break-even</div><div class="data-cell-value">${fmtPct(breakEven)}</div></div>
             <div class="data-cell"><div class="data-cell-label">Market Price</div><div class="data-cell-value">${fmtNum(price, 3)}</div></div>
             <div class="data-cell"><div class="data-cell-label">Net Edge</div><div class="data-cell-value ${edgeClass}">${fmtCents(netEdge)}</div></div>
             <div class="data-cell"><div class="data-cell-label">Confidence</div><div class="data-cell-value">${fmtPct(confidence)}</div></div>
@@ -237,6 +244,7 @@ function renderPositions(positions, markets = []) {
     const pnlClass = pnl >= 0 ? "text-profit-emerald" : "text-loss-rose";
     const signal = signals[pos.market_id] || {};
     const chance = signal.metadata?.estimated_probability;
+    const breakEven = pos.break_even_probability ?? signal.metadata?.break_even_probability_after_fees;
     const edge = signal.metadata?.edge;
     return `
       <div class="border-b border-white/5 pb-4 last:border-0 last:pb-0">
@@ -251,11 +259,48 @@ function renderPositions(positions, markets = []) {
           <span>Avg ${fmtNum(pos.avg_price, 3)}</span>
           <span>Mark ${fmtNum(pos.mark_price, 3)}</span>
           <span>Chance ${fmtPct(chance)}</span>
+          <span>Break-even ${fmtPct(breakEven)}</span>
           <span>Edge ${fmtCents(edge)}</span>
         </div>
       </div>
     `;
   }).join("");
+}
+
+function renderApiError(message, code = "") {
+  setText("#serverStatus", code ? `api ${code}` : "api error");
+  if ($("#serverDot")) $("#serverDot").className = "status-dot dot-warn";
+  setText("#navStatus", state.latest ? "showing last snapshot" : "dashboard API error");
+  if (state.latest) {
+    setText("#updatedAt", `stale · ${state.latest.generated_at || "unknown"}`);
+    return;
+  }
+  setText("#modeLabel", "No API data");
+  setText("#bankrollLabel", "--");
+  setText("#btcPrice", "--");
+  if ($("#btcFreshDot")) $("#btcFreshDot").className = "status-dot dot-warn";
+  if ($("#btcFreshness")) {
+    $("#btcFreshness").innerHTML = `<span class="material-symbols-outlined text-[16px]">lock</span> ${escapeHtml(message)}`;
+  }
+  setText("#totalOrders", "--");
+  setText("#paperVolume", "--");
+  setText("#paperPnl", "--");
+  setText("#unrealizedPnl", "--");
+  setText("#settledWinRate", "--");
+  setText("#settledTrades", "No API data");
+  setText("#openExposure", "--");
+  setText("#pendingSettlementValue", "--");
+  setText("#updatedAt", "--");
+  if ($("#activeMarkets")) {
+    $("#activeMarkets").innerHTML = `
+      <div class="market-card border-t-warning-amber lg:col-span-2">
+        <span class="font-data text-sm bg-surface-variant px-2 py-1 rounded text-on-surface-variant">Dashboard API</span>
+        <h3 class="market-title">API unavailable</h3>
+        <p class="text-sm text-outline mt-3">${escapeHtml(message)}</p>
+      </div>
+    `;
+  }
+  if ($("#openPositions")) $("#openPositions").innerHTML = `<div class="empty-state">${escapeHtml(message)}</div>`;
 }
 
 function renderSafety(safety) {
@@ -288,7 +333,18 @@ async function refresh() {
   if (state.refreshing) return;
   state.refreshing = true;
   try {
-    const response = await fetch(`/api/status?ts=${Date.now()}`, { cache: "no-store", headers: authHeaders() });
+    const response = await fetch(`/api/status?ts=${Date.now()}`, { cache: "no-store" });
+    if (!response.ok) {
+      let message = `HTTP ${response.status}`;
+      try {
+        const payload = await response.json();
+        message = payload.error || message;
+      } catch (_error) {
+        // Keep HTTP message.
+      }
+      renderApiError(message, response.status);
+      return;
+    }
     const data = await response.json();
     state.latest = data;
     const btc = data.btc?.price ? data.btc : {
@@ -327,7 +383,7 @@ async function refresh() {
     renderPositions(data.performance?.positions || [], data.markets || []);
     updateCharts(data);
   } catch (error) {
-    $("#serverStatus").textContent = `api error: ${error.message}`;
+    renderApiError(error.message);
   } finally {
     state.refreshing = false;
   }
@@ -337,16 +393,30 @@ async function forceSettlement() {
   const button = $("#forceSettlementButton");
   const status = $("#settlementStatus");
   if (!button || button.disabled) return;
+  let adminToken = sessionStorage.getItem("dashboard_admin_token") || "";
+  if (!adminToken) {
+    adminToken = window.prompt("Admin token required for settlement") || "";
+    if (!adminToken) return;
+    sessionStorage.setItem("dashboard_admin_token", adminToken);
+  }
   button.disabled = true;
   status.textContent = "Refreshing Gamma results and settling verified pending positions...";
   try {
     const response = await fetch(`/api/settlements/force?ts=${Date.now()}`, {
       method: "POST",
       cache: "no-store",
-      headers: authHeaders({ "Content-Type": "application/json" }),
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${adminToken}`,
+      },
       body: "{}",
     });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    if (!response.ok) {
+      const payload = await response.json().catch(() => ({}));
+      if (response.status === 401) sessionStorage.removeItem("dashboard_admin_token");
+      const retry = payload.retry_after ? ` Retry in ${payload.retry_after}s.` : "";
+      throw new Error(`${payload.error || `HTTP ${response.status}`}.${retry}`);
+    }
     const data = await response.json();
     const settledNow = data.settlement?.settled_now ?? 0;
     const pendingAfter = data.settlement?.pending_after ?? 0;
@@ -371,4 +441,4 @@ if ($("#refreshButton")) $("#refreshButton").addEventListener("click", refresh);
 $("#forceSettlementButton").addEventListener("click", forceSettlement);
 refresh();
 setInterval(renderTimers, 1000);
-setInterval(refresh, 2000);
+setInterval(refresh, 5000);

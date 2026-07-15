@@ -12,6 +12,10 @@ bot.sqlite3-*
 *.paper.lock
 *.log
 probability_model.json
+probability_model.candidate.json
+probability_model.rejected.json
+logs/
+frontend/downloads/
 
 .agents/
 .codex/

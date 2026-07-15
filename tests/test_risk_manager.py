@@ -5,6 +5,8 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from bot.execution.risk_manager import RiskManager, RiskState
+from bot.execution.order_manager import OrderManager
+from bot.execution.paper_broker import PaperBroker
 from bot.polymarket.models import OutcomeSide, Signal, SignalAction
 
 
@@ -87,6 +89,91 @@ def test_consecutive_losses_block_trading(settings, context):
     decision = risk.validate(buy_signal(), context)
     assert decision.approved is False
     assert "consecutive loss" in decision.reason
+
+
+def test_hourly_trade_limit_blocks_trading(settings, context):
+    settings.max_trades_per_hour = 4
+    risk = RiskManager(settings, RiskState(trades_last_hour=4))
+    decision = risk.validate(buy_signal(), context)
+    assert decision.approved is False
+    assert "hourly trade limit" in decision.reason
+
+
+def test_break_even_guard_blocks_financially_bad_signal(settings, context):
+    signal = Signal(
+        action=SignalAction.BUY_UP,
+        confidence=0.9,
+        max_price=0.72,
+        size_usdc=1,
+        reason="test",
+        metadata={
+            "estimated_probability": 0.73,
+            "break_even_probability_after_fees": 0.70,
+            "min_net_edge_cents": 5.0,
+        },
+    )
+    decision = RiskManager(settings).validate(signal, context)
+    assert decision.approved is False
+    assert "break-even" in decision.reason
+
+
+def test_recent_5m_losses_pause_scout(settings, context):
+    settings.disable_5m_after_recent_loss_usdc = 2
+    risk = RiskManager(settings, RiskState(recent_5m_settled_count=3, recent_5m_pnl_usdc=-2.1))
+    decision = risk.validate(buy_signal(), context)
+    assert decision.approved is False
+    assert "5m scout paused" in decision.reason
+
+
+def test_recent_drawdown_reduces_size(settings, context):
+    settings.drawdown_lookback_trades = 10
+    settings.drawdown_pause_loss_usdc = 3
+    settings.drawdown_size_multiplier = 0.5
+    risk = RiskManager(
+        settings,
+        RiskState(
+            recent_settled_count=10,
+            recent_pnl_usdc=-3.5,
+            last_settled_at=datetime.now(UTC),
+        ),
+    )
+    decision = risk.validate(buy_signal(), context)
+    assert decision.approved is True
+    assert "drawdown size reduction" in decision.reason
+    assert decision.size_multiplier == 0.5
+
+
+def test_order_manager_applies_drawdown_size_multiplier(settings, context):
+    settings.drawdown_lookback_trades = 10
+    settings.drawdown_pause_loss_usdc = 3
+    settings.drawdown_size_multiplier = 0.5
+    risk = RiskManager(
+        settings,
+        RiskState(
+            recent_settled_count=10,
+            recent_pnl_usdc=-3.5,
+            last_settled_at=datetime.now(UTC),
+        ),
+    )
+    broker = PaperBroker(settings)
+    signal = Signal(action=SignalAction.BUY_UP, confidence=0.9, max_price=0.52, size_usdc=2, reason="test")
+    order, decision = OrderManager(risk, broker).execute_paper_signal(signal, context)
+
+    assert decision.approved is True
+    assert order is not None
+    assert order.request.size_usdc == 1
+
+
+def test_old_consecutive_losses_do_not_permanently_block(settings, context):
+    risk = RiskManager(
+        settings,
+        RiskState(
+            consecutive_losses=settings.max_consecutive_losses,
+            last_loss_at=datetime.now(UTC) - timedelta(seconds=settings.cooldown_after_loss_seconds + 1),
+        ),
+    )
+    decision = risk.validate(buy_signal(), context)
+    assert decision.approved is True
 
 
 @pytest.mark.asyncio

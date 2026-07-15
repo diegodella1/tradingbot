@@ -56,6 +56,8 @@ class LiveBroker:
         decision = self.risk_manager.validate(signal, context)
         if not decision.approved:
             return OrderRecord(order_id="live-rejected", request=request, status=OrderStatus.REJECTED)
+        if decision.size_multiplier < 1.0:
+            request = request.model_copy(update={"size_usdc": max(1e-6, request.size_usdc * decision.size_multiplier)})
 
         client = self._client()
         tick_size = self._call_first(client, ("get_tick_size", "getTickSize"), request.token_id) or "0.01"

@@ -154,21 +154,58 @@ function renderPositions(positions) {
   }).join("");
 }
 
-async function refreshAnalytics() {
-  const response = await fetch(`/api/analytics?ts=${Date.now()}`, { cache: "no-store", headers: authHeaders() });
-  const data = await response.json();
-  $("#analyticsUpdated").textContent = `SQLite paper metrics updated ${data.generated_at}`;
-  const topbar = $("#topbarUpdated");
-  if (topbar) topbar.textContent = `Updated ${data.generated_at}`;
-  renderKpis(data.kpis || {});
-  renderTimeframes(data.timeframe || []);
-  renderReasons(data.reasons || []);
-  renderHourly(data.hourly || []);
-  renderHeatmap(data.outcomes || []);
-  renderPositions(data.positions || []);
+const ANALYTICS_REFRESH_MS = 15000;
+const ANALYTICS_MAX_BACKOFF_MS = 60000;
+const ANALYTICS_TIMEOUT_MS = 20000;
+let analyticsTimer;
+let analyticsInFlight = false;
+let analyticsFailures = 0;
+
+function scheduleAnalytics(delay = ANALYTICS_REFRESH_MS) {
+  clearTimeout(analyticsTimer);
+  if (!document.hidden) analyticsTimer = setTimeout(refreshAnalytics, delay);
 }
 
-refreshAnalytics().catch((error) => {
-  $("#analyticsUpdated").textContent = `analytics error: ${error.message}`;
+async function refreshAnalytics() {
+  if (analyticsInFlight || document.hidden) return;
+  analyticsInFlight = true;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), ANALYTICS_TIMEOUT_MS);
+  try {
+    const response = await fetch(`/api/analytics?ts=${Date.now()}`, {
+      cache: "no-store",
+      signal: controller.signal,
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data = await response.json();
+    analyticsFailures = 0;
+    $("#analyticsUpdated").textContent = `SQLite paper metrics updated ${data.generated_at}`;
+    const topbar = $("#topbarUpdated");
+    if (topbar) topbar.textContent = `Updated ${data.generated_at}`;
+    renderKpis(data.kpis || {});
+    renderTimeframes(data.timeframe || []);
+    renderReasons(data.reasons || []);
+    renderHourly(data.hourly || []);
+    renderHeatmap(data.outcomes || []);
+    renderPositions(data.positions || []);
+  } catch (error) {
+    analyticsFailures += 1;
+    const message = error.name === "AbortError" ? "request timed out" : error.message;
+    $("#analyticsUpdated").textContent = `analytics error: ${message}`;
+  } finally {
+    clearTimeout(timeout);
+    analyticsInFlight = false;
+    const delay = Math.min(ANALYTICS_REFRESH_MS * (2 ** analyticsFailures), ANALYTICS_MAX_BACKOFF_MS);
+    scheduleAnalytics(delay);
+  }
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) {
+    clearTimeout(analyticsTimer);
+  } else {
+    refreshAnalytics();
+  }
 });
-setInterval(refreshAnalytics, 5000);
+
+refreshAnalytics();

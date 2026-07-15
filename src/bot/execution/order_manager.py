@@ -25,8 +25,9 @@ class OrderManager:
             token_id=context.market.tokens[token_side].token_id,
             side=OrderSide.BUY,
             price=signal.max_price,
-            size_usdc=signal.size_usdc,
+            size_usdc=max(1e-6, signal.size_usdc * decision.size_multiplier),
             reason=signal.reason,
+            metadata={**(signal.metadata or {}), "risk_decision": decision.reason, "risk_size_multiplier": decision.size_multiplier},
         )
         order = self.paper_broker.place_limit_order(request, book)
         if order.filled_size_usdc > 0:
@@ -52,6 +53,7 @@ class OrderManager:
             price=signal.max_price,
             size_usdc=max(cost, 1e-6),
             reason=signal.reason,
+            metadata={**(signal.metadata or {}), "exit_position_id": position.get("id")},
         )
         order, proceeds, exit_fee = self.paper_broker.place_sell_order(request, book, shares)
         if order.filled_size_usdc <= 0:

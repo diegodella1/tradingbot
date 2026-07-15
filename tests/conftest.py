@@ -15,6 +15,36 @@ def settings(tmp_path):
         kill_switch_file=tmp_path / "KILL_SWITCH",
         # Keep tests hermetic: never pick up a real trained model from the repo root.
         probability_model_path=tmp_path / "probability_model.json",
+        enable_experimental_strategy=False,
+        min_seconds_to_close=45,
+        min_seconds_to_close_5m=45,
+        min_seconds_to_close_15m=45,
+        min_entry_price=0.10,
+        min_entry_price_15m=0.10,
+        max_entry_price=0.90,
+        min_estimated_probability=0.60,
+        min_probability_15m=0.60,
+        min_probability_5m=0.60,
+        min_net_edge_cents=1,
+        min_net_edge_15m_cents=1,
+        min_net_edge_5m_cents=1,
+        min_confidence=0.10,
+        min_confidence_5m=0.10,
+        min_book_imbalance=0.05,
+        min_book_imbalance_5m=0.05,
+        enable_5m_scout=True,
+        danger_zone_min_probability=0.60,
+        danger_zone_min_net_edge_cents=1,
+        high_price_min_probability=0.60,
+        high_price_min_net_edge_cents=1,
+        size_tier_base_usdc=0.75,
+        size_tier_good_usdc=1.0,
+        size_tier_strong_usdc=1.5,
+        size_tier_max_usdc=2.0,
+        min_kelly_size_usdc=0.01,
+        max_trades_per_hour=100,
+        disable_5m_after_recent_loss_usdc=999,
+        drawdown_pause_loss_usdc=999,
     )
 
 
@@ -72,4 +102,3 @@ def context(market, book):
             momentum_60s=0.002,
         ),
     )
-

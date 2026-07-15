@@ -50,6 +50,9 @@ CREATE TABLE IF NOT EXISTS signals (
   max_price REAL NOT NULL,
   size_usdc REAL NOT NULL,
   reason TEXT,
+  policy_version TEXT,
+  metadata_json TEXT,
+  config_snapshot_json TEXT,
   created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS orders (
@@ -63,6 +66,9 @@ CREATE TABLE IF NOT EXISTS orders (
   filled_size_usdc REAL,
   avg_fill_price REAL,
   reason TEXT,
+  policy_version TEXT,
+  metadata_json TEXT,
+  config_snapshot_json TEXT,
   created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS fills (
@@ -75,6 +81,9 @@ CREATE TABLE IF NOT EXISTS fills (
   size_usdc REAL NOT NULL,
   fee_usdc REAL DEFAULT 0,
   pnl_usdc REAL NOT NULL,
+  policy_version TEXT,
+  metadata_json TEXT,
+  config_snapshot_json TEXT,
   created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS positions (
@@ -87,6 +96,12 @@ CREATE TABLE IF NOT EXISTS positions (
   fee_usdc REAL DEFAULT 0,
   status TEXT DEFAULT 'OPEN',
   realized_pnl_usdc REAL DEFAULT 0,
+  policy_version TEXT,
+  estimated_probability REAL,
+  break_even_probability REAL,
+  net_edge_cents REAL,
+  metadata_json TEXT,
+  config_snapshot_json TEXT,
   settlement_outcome TEXT,
   settled_at TEXT,
   updated_at TEXT NOT NULL
@@ -167,6 +182,25 @@ CREATE TABLE IF NOT EXISTS learning_recommendations (
   sample_size INTEGER NOT NULL,
   suggested_config_json TEXT
 );
+CREATE TABLE IF NOT EXISTS policy_versions (
+  version TEXT PRIMARY KEY,
+  status TEXT NOT NULL CHECK(status IN ('candidate', 'paper_active', 'validated', 'rejected', 'stopped')),
+  is_active INTEGER NOT NULL DEFAULT 0 CHECK(is_active IN (0, 1)),
+  config_json TEXT NOT NULL,
+  config_sha256 TEXT,
+  oos_metrics_json TEXT,
+  evidence_sha256 TEXT,
+  model_sha256 TEXT,
+  rejection_reason TEXT,
+  created_at TEXT NOT NULL,
+  activated_at TEXT,
+  evaluated_at TEXT
+);
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  version TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  applied_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS discovery_rejections (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   market_type TEXT,
@@ -174,6 +208,18 @@ CREATE TABLE IF NOT EXISTS discovery_rejections (
   slug TEXT,
   reason TEXT NOT NULL,
   created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS discovery_rejection_rollups (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  market_type TEXT NOT NULL DEFAULT '',
+  question TEXT NOT NULL DEFAULT '',
+  slug TEXT NOT NULL DEFAULT '',
+  reason TEXT NOT NULL,
+  bucket_start TEXT NOT NULL,
+  occurrences INTEGER NOT NULL DEFAULT 1,
+  first_seen_at TEXT NOT NULL,
+  last_seen_at TEXT NOT NULL,
+  UNIQUE(market_type, slug, reason, bucket_start)
 );
 CREATE TABLE IF NOT EXISTS strategy_decisions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -189,19 +235,78 @@ CREATE TABLE IF NOT EXISTS strategy_decisions (
   confidence REAL NOT NULL,
   reason TEXT,
   metadata_json TEXT,
+  policy_version TEXT,
+  config_snapshot_json TEXT,
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_market_snapshots_market_created ON market_snapshots(market_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_market_snapshots_created ON market_snapshots(created_at);
 CREATE INDEX IF NOT EXISTS idx_btc_ticks_created ON btc_ticks(created_at);
 CREATE INDEX IF NOT EXISTS idx_signals_market_created ON signals(market_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_signals_created ON signals(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_fills_created ON fills(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_risk_events_created ON risk_events(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_health_events_name_created ON health_events(name, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_learning_notes_created ON learning_notes(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_discovery_rejections_created ON discovery_rejections(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_strategy_decisions_created ON strategy_decisions(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_learning_recommendations_created ON learning_recommendations(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_policy_versions_status ON policy_versions(status);
+CREATE INDEX IF NOT EXISTS idx_discovery_rejection_rollups_last_seen
+ON discovery_rejection_rollups(last_seen_at DESC);
 """
+
+MIGRATIONS = (
+    (
+        "20260714_analytics_snapshot_lookup",
+        "analytics snapshot lookup index",
+        """
+        CREATE INDEX IF NOT EXISTS idx_market_snapshots_market_token_created
+        ON market_snapshots(market_id, token_id, created_at DESC, best_bid)
+        """,
+    ),
+    (
+        "20260714_analytics_decision_core",
+        "analytics decision core covering index",
+        """
+        CREATE INDEX IF NOT EXISTS idx_strategy_decisions_analytics_core
+        ON strategy_decisions(market_type, action, edge, confidence, kelly_fraction)
+        """,
+    ),
+    (
+        "20260714_analytics_decision_reason",
+        "analytics decision reason index",
+        """
+        CREATE INDEX IF NOT EXISTS idx_strategy_decisions_reason
+        ON strategy_decisions(reason)
+        """,
+    ),
+    (
+        "20260714_analytics_decision_hour",
+        "analytics decision hour covering index",
+        """
+        CREATE INDEX IF NOT EXISTS idx_strategy_decisions_hour_edge
+        ON strategy_decisions(substr(created_at, 12, 2), edge)
+        """,
+    ),
+    (
+        "20260714_analytics_rejection_count",
+        "analytics rejection count covering index",
+        """
+        CREATE INDEX IF NOT EXISTS idx_discovery_rejections_count
+        ON discovery_rejections(id)
+        """,
+    ),
+    (
+        "20260715_policy_single_active",
+        "enforce one active policy",
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_policy_versions_single_active
+        ON policy_versions(is_active) WHERE is_active = 1
+        """,
+    ),
+)
 
 
 def connect(path: Path) -> sqlite3.Connection:
@@ -221,6 +326,8 @@ def init_db(path: Path) -> None:
         _ensure_column(conn, "positions", "fee_usdc", "REAL DEFAULT 0")
         _ensure_column(conn, "positions", "status", "TEXT DEFAULT 'OPEN'")
         _ensure_column(conn, "positions", "realized_pnl_usdc", "REAL DEFAULT 0")
+        _ensure_policy_columns(conn)
+        _run_migrations(conn)
         _ensure_column(conn, "positions", "settlement_outcome", "TEXT")
         _ensure_column(conn, "positions", "settled_at", "TEXT")
         _ensure_column(conn, "fills", "fee_usdc", "REAL DEFAULT 0")
@@ -288,6 +395,8 @@ def force_settle_pending_positions(path: Path) -> dict[str, int]:
         _ensure_column(conn, "positions", "fee_usdc", "REAL DEFAULT 0")
         _ensure_column(conn, "positions", "status", "TEXT DEFAULT 'OPEN'")
         _ensure_column(conn, "positions", "realized_pnl_usdc", "REAL DEFAULT 0")
+        _ensure_policy_columns(conn)
+        _run_migrations(conn)
         _ensure_column(conn, "positions", "settlement_outcome", "TEXT")
         _ensure_column(conn, "positions", "settled_at", "TEXT")
         _ensure_column(conn, "fills", "fee_usdc", "REAL DEFAULT 0")
@@ -334,11 +443,45 @@ def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
+def _run_migrations(conn: sqlite3.Connection) -> None:
+    for version, name, sql in MIGRATIONS:
+        applied = conn.execute("SELECT 1 FROM schema_migrations WHERE version = ?", (version,)).fetchone()
+        if applied:
+            continue
+        conn.execute(sql)
+        conn.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)",
+            (version, name, datetime.now(UTC).isoformat()),
+        )
+
+
+def _ensure_policy_columns(conn: sqlite3.Connection) -> None:
+    for table in ("signals", "orders", "fills", "strategy_decisions"):
+        _ensure_column(conn, table, "policy_version", "TEXT")
+        _ensure_column(conn, table, "metadata_json", "TEXT")
+        _ensure_column(conn, table, "config_snapshot_json", "TEXT")
+    _ensure_column(conn, "positions", "policy_version", "TEXT")
+    _ensure_column(conn, "positions", "estimated_probability", "REAL")
+    _ensure_column(conn, "positions", "break_even_probability", "REAL")
+    _ensure_column(conn, "positions", "net_edge_cents", "REAL")
+    _ensure_column(conn, "positions", "metadata_json", "TEXT")
+    _ensure_column(conn, "positions", "config_snapshot_json", "TEXT")
+    _ensure_column(conn, "policy_versions", "is_active", "INTEGER NOT NULL DEFAULT 0")
+    _ensure_column(conn, "policy_versions", "config_sha256", "TEXT")
+    _ensure_column(conn, "policy_versions", "evidence_sha256", "TEXT")
+    _ensure_column(conn, "policy_versions", "model_sha256", "TEXT")
+
+
 def _backfill_open_positions(conn: sqlite3.Connection) -> None:
     now = datetime.now(UTC).isoformat()
     conn.execute(
         """
-        INSERT INTO positions (market_id, token_id, size_usdc, avg_price, shares, fee_usdc, status, realized_pnl_usdc, updated_at)
+        INSERT INTO positions (
+            market_id, token_id, size_usdc, avg_price, shares, fee_usdc,
+            status, realized_pnl_usdc, policy_version, estimated_probability,
+            break_even_probability, net_edge_cents, metadata_json,
+            config_snapshot_json, updated_at
+        )
         SELECT f.market_id,
                f.token_id,
                SUM(f.size_usdc) AS size_usdc,
@@ -347,6 +490,12 @@ def _backfill_open_positions(conn: sqlite3.Connection) -> None:
                COALESCE(SUM(f.fee_usdc), 0) AS fee_usdc,
                CASE WHEN m.end_time IS NOT NULL AND m.end_time <= ? THEN 'EXPIRED_UNKNOWN' ELSE 'OPEN' END,
                0,
+               MAX(f.policy_version),
+               AVG(json_extract(f.metadata_json, '$.estimated_probability')),
+               AVG(json_extract(f.metadata_json, '$.break_even_probability_after_fees')),
+               AVG(json_extract(f.metadata_json, '$.net_edge_cents')),
+               MAX(f.metadata_json),
+               MAX(f.config_snapshot_json),
                MAX(f.created_at)
         FROM fills f
         LEFT JOIN markets m ON m.market_id = f.market_id

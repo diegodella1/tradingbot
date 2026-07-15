@@ -16,6 +16,7 @@ def kelly_fraction(probability: float, price: float) -> float:
 class MomentumBookImbalanceStrategy(Strategy):
     def __init__(self, settings: Settings):
         self.settings = settings
+        self.config_snapshot = settings.strategy_config_snapshot()
         # A calibrated model (trained via `cli calibrate`) supersedes the hand-tuned
         # heuristic when present; otherwise we fall back to the heuristic scoring.
         # Models trained with an older feature layout are ignored, not misapplied.
@@ -24,44 +25,50 @@ class MomentumBookImbalanceStrategy(Strategy):
 
     def evaluate(self, context: MarketContext) -> Signal:
         if not self.settings.enable_experimental_strategy:
-            return Signal(action=SignalAction.HOLD, reason="experimental strategy disabled")
+            return self._hold("experimental strategy disabled", context)
         if not context.market.is_tradeable:
-            return Signal(action=SignalAction.HOLD, reason="market not verified tradeable")
+            return self._hold("market not verified tradeable", context)
         if not context.up_book or not context.down_book:
-            return Signal(action=SignalAction.HOLD, reason="missing order book")
+            return self._hold("missing order book", context)
 
         max_age = 3 if context.market.market_type.value == "5m" else 5
         if not context.btc.is_fresh(max_age):
-            return Signal(action=SignalAction.HOLD, reason="stale BTC feed")
-        if context.market.seconds_to_close is None or context.market.seconds_to_close < self.settings.min_seconds_to_close:
-            return Signal(action=SignalAction.HOLD, reason="too close to market close")
+            return self._hold("stale BTC feed", context)
+        min_seconds_to_close = self.settings.minimum_seconds_to_close_for(context.market.market_type.value)
+        if context.market.seconds_to_close is None or context.market.seconds_to_close < min_seconds_to_close:
+            return self._hold("too close to market close", context)
         if context.btc.realized_volatility > self.settings.max_realized_volatility:
             # In extreme volatility regimes the outcome is close to a coin flip.
-            return Signal(action=SignalAction.HOLD, reason="volatility regime too extreme")
+            return self._hold("volatility regime too extreme", context)
         if (
             self.settings.min_abs_change_since_open > 0
             and abs(context.btc.change_since_open) < self.settings.min_abs_change_since_open
         ):
             # Tiny moves can flip on the Coinbase-vs-Chainlink divergence: the
             # resolution oracle may sit on the other side of our proxy price.
-            return Signal(action=SignalAction.HOLD, reason="move since open too small vs oracle divergence")
+            return self._hold("move since open too small vs oracle divergence", context)
 
         up = self._candidate(SignalAction.BUY_UP, context.up_book, context)
         down = self._candidate(SignalAction.BUY_DOWN, context.down_book, context)
         return max([up, down], key=lambda signal: signal.confidence)
 
     def _candidate(self, action: SignalAction, book: OrderBook, context: MarketContext) -> Signal:
+        market_type = context.market.market_type.value
+        if market_type == "5m" and not self.settings.enable_5m_scout:
+            return self._hold("5m scout disabled", context, {"candidate_action": action.value})
         ask = book.best_ask
         if ask is None:
-            return Signal(action=SignalAction.HOLD, reason="missing ask")
-        if ask < self.settings.min_entry_price or ask > self.settings.max_entry_price:
-            return Signal(action=SignalAction.HOLD, reason="price outside entry band")
+            return self._hold("missing ask", context, {"candidate_action": action.value})
+        base_metadata = self._policy_metadata(context, {"candidate_action": action.value, "market_price": ask})
+        min_entry_price = self.settings.minimum_entry_price_for(market_type)
+        if ask < min_entry_price or ask > self.settings.max_entry_price:
+            return Signal(action=SignalAction.HOLD, reason="price outside entry band", metadata=base_metadata)
 
         spread = book.spread
         if spread is None or spread * 100 > self.settings.max_spread_cents:
-            return Signal(action=SignalAction.HOLD, reason="spread too wide")
+            return Signal(action=SignalAction.HOLD, reason="spread too wide", metadata=base_metadata | {"spread": spread})
         if book.top_liquidity_usdc < self.settings.min_orderbook_liquidity_usdc:
-            return Signal(action=SignalAction.HOLD, reason="insufficient book liquidity")
+            return Signal(action=SignalAction.HOLD, reason="insufficient book liquidity", metadata=base_metadata | {"book_liquidity_usdc": book.top_liquidity_usdc})
 
         wants_up = action == SignalAction.BUY_UP
         direction = 1 if wants_up else -1
@@ -77,19 +84,21 @@ class MomentumBookImbalanceStrategy(Strategy):
         momentum_60 = direction * context.btc.momentum_60s
         open_move = direction * context.btc.change_since_open
         book_support = direction * book.imbalance
+        min_book_imbalance = self.settings.minimum_book_imbalance_for(market_type)
         if momentum_15 <= 0 or momentum_60 <= 0 or open_move <= 0:
-            return Signal(action=SignalAction.HOLD, reason="BTC momentum not aligned", metadata={"features": features})
-        if book_support < self.settings.min_book_imbalance:
-            return Signal(action=SignalAction.HOLD, reason="book imbalance not supportive", metadata={"features": features})
+            return Signal(action=SignalAction.HOLD, reason="BTC momentum not aligned", metadata=base_metadata | {"features": features})
+        if book_support < min_book_imbalance:
+            return Signal(action=SignalAction.HOLD, reason="book imbalance not supportive", metadata=base_metadata | {"features": features})
 
         estimated_probability, probability_source = self._estimate_probability(context, book, ask, direction)
-        if estimated_probability < self.settings.min_estimated_probability:
+        min_probability, min_net_edge_cents = self.settings.price_bucket_requirements(market_type, ask)
+        if estimated_probability < min_probability:
             # Underdogs with nominal edge lost consistently in production data
             # (0% WR below p=0.6); winning often requires being the favorite.
             return Signal(
                 action=SignalAction.HOLD,
                 reason="estimated probability below minimum",
-                metadata={"features": features, "estimated_probability": estimated_probability},
+                metadata=base_metadata | {"features": features, "estimated_probability": estimated_probability, "min_probability": min_probability},
             )
         edge = estimated_probability - ask
         shares_per_1 = 1 / ask if ask > 0 else 0.0
@@ -101,37 +110,49 @@ class MomentumBookImbalanceStrategy(Strategy):
         )
         break_even_probability_after_fees = (1 + estimated_fee_per_1) / shares_per_1 if shares_per_1 > 0 else 1.0
         net_edge = estimated_probability - break_even_probability_after_fees
+        net_edge_cents = net_edge * 100
         confidence = max(0.0, min(1.0, abs(estimated_probability - 0.5) * 2 + max(0.0, book_support)))
         kelly = kelly_fraction(estimated_probability, ask)
-        recommended_size = min(
-            self.settings.paper_trade_size_usdc,
+        max_trade_size = min(
             self.settings.max_position_usdc,
+            self.settings.max_market_position_usdc,
+            self.settings.paper_bankroll_usdc * self.settings.max_trade_pct_for(market_type),
+        )
+        tier_size = self.settings.size_tier_usdc(estimated_probability, net_edge_cents)
+        recommended_size = min(
+            tier_size,
+            max_trade_size,
             self.settings.paper_bankroll_usdc * kelly * self.settings.kelly_fraction_multiplier,
         )
-        metadata = {
+        min_confidence = self.settings.minimum_confidence_for(market_type)
+        metadata = base_metadata | {
+            "market_type": market_type,
             "estimated_probability": estimated_probability,
             "probability_source": probability_source,
+            "min_probability": min_probability,
             "market_price": ask,
             "edge": edge,
             "edge_cents": edge * 100,
             "net_edge": net_edge,
-            "net_edge_cents": net_edge * 100,
+            "net_edge_cents": net_edge_cents,
+            "min_net_edge_cents": min_net_edge_cents,
             "profit_if_win_per_1": profit_if_win_per_1,
             "break_even_probability_after_fees": break_even_probability_after_fees,
             "estimated_fee_per_1": estimated_fee_per_1,
             "ev_usdc_per_1": edge / ask if ask > 0 else 0.0,
             "kelly_fraction": kelly,
+            "max_trade_pct": self.settings.max_trade_pct_for(market_type),
+            "max_trade_size_usdc": max_trade_size,
+            "size_tier_usdc": tier_size,
             "recommended_size_usdc": recommended_size,
             "features": features,
         }
 
-        if confidence < self.settings.min_confidence:
+        if confidence < min_confidence:
             return Signal(action=SignalAction.HOLD, confidence=confidence, reason=f"{OutcomeSide.UP if wants_up else OutcomeSide.DOWN} confidence too low", metadata=metadata)
-        if profit_if_win_per_1 < self.settings.min_profit_if_win_usdc:
-            return Signal(action=SignalAction.HOLD, confidence=confidence, reason="profit if win below minimum", metadata=metadata)
         if edge * 100 < self.settings.min_edge_cents:
             return Signal(action=SignalAction.HOLD, confidence=confidence, reason=f"{OutcomeSide.UP if wants_up else OutcomeSide.DOWN} edge below threshold", metadata=metadata)
-        if net_edge * 100 < self.settings.min_net_edge_cents:
+        if net_edge_cents < min_net_edge_cents:
             return Signal(action=SignalAction.HOLD, confidence=confidence, reason="net edge after fees below threshold", metadata=metadata)
         if recommended_size < self.settings.min_kelly_size_usdc:
             return Signal(action=SignalAction.HOLD, confidence=confidence, reason="Kelly size below minimum", metadata=metadata)
@@ -200,3 +221,18 @@ class MomentumBookImbalanceStrategy(Strategy):
                 metadata=metadata,
             )
         return Signal(action=SignalAction.HOLD, reason="position still favorable", metadata=metadata)
+
+    def _hold(self, reason: str, context: MarketContext, metadata: dict | None = None) -> Signal:
+        return Signal(action=SignalAction.HOLD, reason=reason, metadata=self._policy_metadata(context, metadata))
+
+    def _policy_metadata(self, context: MarketContext, metadata: dict | None = None) -> dict:
+        payload = {
+            "policy_version": self.settings.policy_version,
+            "config_snapshot": self.config_snapshot,
+            "market_type": context.market.market_type.value,
+            "seconds_to_close": context.market.seconds_to_close,
+            "probability_source": "calibrated" if self.model is not None else "heuristic",
+        }
+        if metadata:
+            payload.update(metadata)
+        return payload

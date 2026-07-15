@@ -50,6 +50,7 @@ class PaperBroker:
                 price=fill_price,
                 size_usdc=filled,
                 fee_usdc=fee,
+                metadata=request.metadata,
             )
         )
         return record
@@ -87,6 +88,7 @@ class PaperBroker:
                 price=fill_price,
                 size_usdc=proceeds,
                 fee_usdc=fee,
+                metadata=request.metadata,
             )
         )
         return record, proceeds, fee

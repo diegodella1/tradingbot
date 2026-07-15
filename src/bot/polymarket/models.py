@@ -167,6 +167,7 @@ class OrderRequest(BaseModel):
     price: float = Field(ge=0.0, le=1.0)
     size_usdc: float = Field(gt=0.0)
     reason: str = ""
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class OrderRecord(BaseModel):
@@ -188,4 +189,5 @@ class FillRecord(BaseModel):
     size_usdc: float
     fee_usdc: float = 0.0
     pnl_usdc: float = 0.0
+    metadata: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
