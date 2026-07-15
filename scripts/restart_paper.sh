@@ -2,12 +2,12 @@
 set -euo pipefail
 
 UNIT="${PAPER_SYSTEMD_UNIT:-tradingbot-paper.service}"
-SYSTEMCTL="${SYSTEMCTL_BIN:-systemctl}"
+SYSTEMCTL=(sudo "${SYSTEMCTL_BIN:-systemctl}")
 
-old_pid="$($SYSTEMCTL show "$UNIT" --property MainPID --value)"
-$SYSTEMCTL restart "$UNIT"
-$SYSTEMCTL is-active --quiet "$UNIT"
-new_pid="$($SYSTEMCTL show "$UNIT" --property MainPID --value)"
+old_pid="$("${SYSTEMCTL[@]}" show "$UNIT" --property MainPID --value)"
+"${SYSTEMCTL[@]}" restart "$UNIT"
+"${SYSTEMCTL[@]}" is-active --quiet "$UNIT"
+new_pid="$("${SYSTEMCTL[@]}" show "$UNIT" --property MainPID --value)"
 
 if [ -z "$new_pid" ] || [ "$new_pid" = "0" ]; then
   echo "ERROR paper_restart_missing_pid=true unit=$UNIT"

@@ -14,15 +14,15 @@ if [ -e "$OUTPUT" ]; then
   exit 1
 fi
 
-systemctl stop tradingbot-paper.service tradingbot-frontend.service
+sudo systemctl stop tradingbot-paper.service tradingbot-frontend.service
 
 rollback() {
-  systemctl stop tradingbot-paper.service tradingbot-frontend.service || true
+  sudo systemctl stop tradingbot-paper.service tradingbot-frontend.service || true
   if [ -e "$DATABASE" ] && [ -e "$PREVIOUS" ]; then
     mv "$DATABASE" "$FAILED"
     mv "$PREVIOUS" "$DATABASE"
   fi
-  systemctl start tradingbot-paper.service tradingbot-frontend.service || true
+  sudo systemctl start tradingbot-paper.service tradingbot-frontend.service || true
   echo "maintenance_rollback=true restored=$DATABASE failed_copy=$FAILED"
 }
 trap rollback ERR
@@ -36,7 +36,7 @@ PYTHONPATH="$ROOT_DIR/src" "$ROOT_DIR/.venv/bin/python" \
 mv "$DATABASE" "$PREVIOUS"
 rm -f "$DATABASE-wal" "$DATABASE-shm"
 mv "$OUTPUT" "$DATABASE"
-systemctl start tradingbot-paper.service tradingbot-frontend.service
+sudo systemctl start tradingbot-paper.service tradingbot-frontend.service
 
 for _ in $(seq 1 30); do
   if curl -fsS --max-time 3 http://127.0.0.1:8888/api/healthz | \

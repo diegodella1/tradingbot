@@ -32,7 +32,10 @@ if [ ! -d "$RELEASE_DIR" ]; then
 fi
 printf 'DEPLOY_COMMIT=%s\n' "$SHA" > "$RELEASE_DIR/deploy.env"
 
-PREVIOUS_RELEASE="$(readlink -f "$CURRENT_LINK" 2>/dev/null || true)"
+PREVIOUS_RELEASE=""
+if [ -L "$CURRENT_LINK" ]; then
+  PREVIOUS_RELEASE="$(readlink -f "$CURRENT_LINK" 2>/dev/null || true)"
+fi
 ln -sfn "$RELEASE_DIR" "$NEXT_LINK"
 mv -Tf "$NEXT_LINK" "$CURRENT_LINK"
 
@@ -40,13 +43,13 @@ rollback() {
   if [ -n "$PREVIOUS_RELEASE" ] && [ -d "$PREVIOUS_RELEASE" ]; then
     ln -sfn "$PREVIOUS_RELEASE" "$NEXT_LINK"
     mv -Tf "$NEXT_LINK" "$CURRENT_LINK"
-    systemctl restart tradingbot-paper.service tradingbot-frontend.service
+    sudo systemctl restart tradingbot-paper.service tradingbot-frontend.service
     echo "deployment_rolled_back_to=$PREVIOUS_RELEASE"
   fi
 }
 trap rollback ERR
 
-systemctl restart tradingbot-paper.service tradingbot-frontend.service
+sudo systemctl restart tradingbot-paper.service tradingbot-frontend.service
 
 for _ in $(seq 1 30); do
   HEALTH="$(curl -fsS --max-time 3 http://127.0.0.1:8888/api/healthz 2>/dev/null || true)"
