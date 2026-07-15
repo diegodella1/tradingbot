@@ -47,6 +47,7 @@ SETTLEMENT_COOLDOWN_SECONDS = 60.0
 
 _status_lock = threading.Lock()
 _status_cache: tuple[float, str, dict] | None = None
+_status_refreshing = False
 _analytics_lock = threading.Lock()
 _analytics_cache: tuple[float, str, dict] | None = None
 _counts_lock = threading.Lock()
@@ -157,10 +158,21 @@ class DashboardHandler(SimpleHTTPRequestHandler):
 
 
 def status_payload() -> dict:
-    global _status_cache
+    global _status_cache, _status_refreshing
     cache_key = str(get_settings().sqlite_path.resolve())
     now = time.monotonic()
     if _status_cache and _status_cache[1] == cache_key and now - _status_cache[0] < STATUS_CACHE_SECONDS:
+        return _status_cache[2]
+    if _status_cache and _status_cache[1] == cache_key:
+        with _status_lock:
+            if not _status_refreshing:
+                _status_refreshing = True
+                threading.Thread(
+                    target=_refresh_status_payload,
+                    args=(cache_key,),
+                    daemon=True,
+                    name="dashboard-status-refresh",
+                ).start()
         return _status_cache[2]
     with _status_lock:
         now = time.monotonic()
@@ -169,6 +181,17 @@ def status_payload() -> dict:
         payload = _build_status_payload()
         _status_cache = (time.monotonic(), cache_key, payload)
         return payload
+
+
+def _refresh_status_payload(cache_key: str) -> None:
+    global _status_cache, _status_refreshing
+    try:
+        payload = _build_status_payload()
+        with _status_lock:
+            _status_cache = (time.monotonic(), cache_key, payload)
+    finally:
+        with _status_lock:
+            _status_refreshing = False
 
 
 def _build_status_payload() -> dict:
@@ -306,9 +329,10 @@ def _finish_settlement() -> None:
 
 
 def _reset_dashboard_runtime_state() -> None:
-    global _analytics_cache, _counts_cache, _last_settlement_completed_at, _settlement_running, _status_cache
+    global _analytics_cache, _counts_cache, _last_settlement_completed_at, _settlement_running, _status_cache, _status_refreshing
     with _status_lock, _analytics_lock, _counts_lock, _settlement_lock:
         _status_cache = None
+        _status_refreshing = False
         _analytics_cache = None
         _counts_cache = None
         _settlement_running = False
@@ -1319,6 +1343,7 @@ def main() -> None:
     host = "127.0.0.1"
     port = 8888
     init_db(get_settings().sqlite_path)
+    status_payload()
     server = ThreadingHTTPServer((host, port), DashboardHandler)
     print(f"Tradingbot frontend serving on http://{host}:{port}")
     server.serve_forever()
