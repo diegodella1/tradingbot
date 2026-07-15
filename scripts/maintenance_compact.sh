@@ -39,10 +39,14 @@ mv "$OUTPUT" "$DATABASE"
 sudo systemctl start tradingbot-paper.service tradingbot-frontend.service
 
 for _ in $(seq 1 30); do
-  if curl -fsS --max-time 3 http://127.0.0.1:8888/api/healthz | \
-    "$ROOT_DIR/.venv/bin/python" -c 'import json,sys; p=json.load(sys.stdin); raise SystemExit(0 if p.get("ok") else 1)'; then
+  HEALTH="$(curl -fsS --max-time 3 http://127.0.0.1:8888/api/healthz 2>/dev/null || true)"
+  if [ -n "$HEALTH" ] && \
+    "$ROOT_DIR/.venv/bin/python" -c \
+      'import json,sys; raise SystemExit(0 if json.loads(sys.argv[1]).get("ok") else 1)' \
+      "$HEALTH" 2>/dev/null; then
     trap - ERR
-    echo "maintenance_compaction_ok=true previous=$PREVIOUS database=$DATABASE"
+    rm -f "$PREVIOUS"
+    echo "maintenance_compaction_ok=true backup_directory=$BACKUP_DIR database=$DATABASE"
     exit 0
   fi
   sleep 1
