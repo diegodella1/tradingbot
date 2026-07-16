@@ -88,6 +88,7 @@ class Settings(BaseSettings):
     max_trade_pct_15m: float = 0.02
     max_trade_pct_5m: float = 0.0075
     max_trades_per_hour: int = 2
+    max_trades_per_day: int = 6
     disable_5m_after_recent_loss_usdc: float = 2.0
     recent_5m_loss_lookback: int = 10
     danger_zone_min_price: float = 0.70
@@ -256,6 +257,8 @@ class Settings(BaseSettings):
             "min_seconds_to_close",
             "min_seconds_to_close_5m",
             "min_seconds_to_close_15m",
+            "max_trades_per_hour",
+            "max_trades_per_day",
             "paper_bankroll_usdc",
             "paper_trade_size_usdc",
             "paper_enable_fees",

@@ -32,7 +32,7 @@ from bot.strategy.no_trade import NoTradeStrategy
 from bot.util.filelock import FileLock, LockAlreadyHeld
 
 # Reuse the paper-loop helpers to keep a single source of truth for shared logic.
-from bot.main import _apply_realtime_state, _market_open_price, _sync_risk_state, _track_feed_degradation
+from bot.main import _apply_realtime_state, _btc_state_for_cycle, _market_open_price, _sync_risk_state, _track_feed_degradation
 
 
 async def _preflight(settings: Settings) -> None:
@@ -108,12 +108,8 @@ async def run_live_loop(settings: Settings, max_cycles: int | None = None) -> No
 async def _live_cycle(settings, gamma, clob, btc_feed, broker, tracker, risk, strategy, repo, log, realtime) -> None:
     _sync_risk_state(settings, repo, risk)
     try:
-        if realtime is not None and btc_feed.current_price is not None:
-            btc_state = btc_feed.state
-            _track_feed_degradation(settings, repo, realtime, using_rest=False)
-        else:
-            btc_state = await btc_feed.poll_once()
-            _track_feed_degradation(settings, repo, realtime, using_rest=True)
+        btc_state, btc_source = await _btc_state_for_cycle(settings, btc_feed, realtime)
+        _track_feed_degradation(settings, repo, realtime, using_rest=btc_source == "rest")
         if btc_state.current_price is not None:
             repo.save_btc_tick(btc_state.current_price)
     except Exception as exc:

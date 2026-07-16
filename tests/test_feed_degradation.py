@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from datetime import UTC, datetime, timedelta
 
-from bot.main import _track_feed_degradation
+import pytest
+
+from bot.btc.price_feed import CoinbaseBtcFeed
+from bot.main import _btc_state_for_cycle, _track_feed_degradation
 from bot.storage.db import connect, init_db
 from bot.storage.repositories import Repository
 
@@ -64,3 +68,38 @@ def test_rest_only_mode_is_ignored(settings):
         repo = Repository(conn)
         _track_feed_degradation(settings, repo, None, using_rest=True)
         assert _last_btc_feed_event(conn) is None
+
+
+@pytest.mark.asyncio
+async def test_stale_stream_falls_back_to_rest(settings, monkeypatch):
+    feed = CoinbaseBtcFeed(settings)
+    feed.ticks.add(60_000, datetime.now(UTC) - timedelta(seconds=30))
+    polled = False
+
+    async def poll_once():
+        nonlocal polled
+        polled = True
+        feed.ticks.add(60_100, datetime.now(UTC))
+        return feed.state
+
+    monkeypatch.setattr(feed, "poll_once", poll_once)
+    state, source = await _btc_state_for_cycle(settings, feed, SimpleNamespace())
+
+    assert polled is True
+    assert source == "rest"
+    assert state.current_price == 60_100
+
+
+@pytest.mark.asyncio
+async def test_fresh_stream_does_not_poll_rest(settings, monkeypatch):
+    feed = CoinbaseBtcFeed(settings)
+    feed.ticks.add(60_000, datetime.now(UTC))
+
+    async def unexpected_poll():
+        raise AssertionError("fresh websocket state should be used")
+
+    monkeypatch.setattr(feed, "poll_once", unexpected_poll)
+    state, source = await _btc_state_for_cycle(settings, feed, SimpleNamespace())
+
+    assert source == "websocket"
+    assert state.current_price == 60_000

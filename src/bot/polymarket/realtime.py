@@ -72,8 +72,15 @@ class RealtimeMarketData:
 
     @property
     def connected(self) -> bool:
-        market_ok = self._market_ws.connected if self._market_ws is not None else False
-        return bool(self.btc_feed.connected and market_ok)
+        return self.btc_connected and self.market_connected
+
+    @property
+    def btc_connected(self) -> bool:
+        return bool(self.btc_feed.connected)
+
+    @property
+    def market_connected(self) -> bool:
+        return bool(self._market_ws is not None and self._market_ws.connected)
 
     def get_book(self, token_id: str) -> OrderBook | None:
         if self.cache.is_fresh(token_id, self.settings.websocket_book_max_age_seconds):

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from bot.backtest import recommend, recommended_env_lines, run_sweep, run_walk_forward_sweep, split_rows_by_market
+from bot.backtest import recommend, recommend_policy, recommended_env_lines, run_sweep, run_walk_forward_sweep, split_rows_by_market
 from bot.backtest.dataset import TrainingRow
 from bot.strategy.calibration import FEATURE_NAMES, ProbabilityModel, build_features
 
@@ -127,3 +127,49 @@ def test_recommended_env_lines_include_market_filter_when_15m_only():
     assert "MIN_SECONDS_TO_CLOSE=300" in lines
     if best.only_15m:
         assert "MARKET_TYPES=15m" in lines
+
+
+def test_policy_sweep_applies_full_gates_and_daily_limit(settings):
+    model = ProbabilityModel(
+        weights=[0.0] * N_EXTRAS,
+        bias=0.8,
+        means=[0.0] * N_EXTRAS,
+        stds=[1.0] * N_EXTRAS,
+    )
+    settings.max_trades_per_hour = 2
+    settings.max_trades_per_day = 6
+    settings.min_edge_cents = 1
+    settings.min_confidence = 0.1
+    settings.min_book_imbalance = 0.0
+    settings.min_kelly_size_usdc = 0.01
+    start = 1_750_000_000.0
+    rows = [
+        _row(
+            f"m{i}",
+            "UP",
+            0.60,
+            0 if i % 6 == 0 else 1,
+            600,
+            start + i * 14_400,
+            market_type="15m",
+        )
+        for i in range(30)
+    ]
+
+    cells = run_sweep(
+        rows,
+        model,
+        fee_rate=0.07,
+        min_probabilities=(0.65,),
+        min_seconds=(300,),
+        price_bands=((0.55, 0.69),),
+        min_net_edges=(5.0,),
+        settings=settings,
+    )
+    candidate = recommend_policy(cells, min_trades=20)
+
+    assert candidate is not None
+    assert candidate.only_15m is True
+    assert 2 <= candidate.trades_per_day <= 6
+    assert candidate.profit_factor is not None and candidate.profit_factor >= 1.1
+    assert candidate.max_drawdown_pct <= 0.15

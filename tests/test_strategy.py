@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
 from bot.strategy.momentum_book_imbalance import MomentumBookImbalanceStrategy, kelly_fraction
 from bot.strategy.no_trade import NoTradeStrategy
-from bot.polymarket.models import MarketType, SignalAction
+from bot.polymarket.models import MarketType, Signal, SignalAction
 
 
 def test_no_trade_strategy_returns_hold(context):
@@ -198,6 +200,42 @@ def test_strategy_blocks_5m_when_scout_disabled(settings, context):
 
     assert signal.action == SignalAction.HOLD
     assert "5m scout disabled" in signal.reason
+
+
+def test_strategy_reports_all_failed_gates_without_changing_primary_reason(settings, context):
+    settings.enable_experimental_strategy = True
+    settings.enable_5m_scout = False
+    context.btc.price_timestamp = datetime.now(UTC) - timedelta(seconds=30)
+
+    signal = MomentumBookImbalanceStrategy(settings).evaluate(context)
+
+    assert signal.reason == "stale BTC feed"
+    assert signal.metadata["primary_reason"] == "stale BTC feed"
+    assert "feed.stale_btc" in signal.metadata["failed_gates"]
+    assert "UP.scout_disabled" in signal.metadata["failed_gates"]
+    assert "DOWN.scout_disabled" in signal.metadata["failed_gates"]
+
+
+def test_executable_side_beats_higher_confidence_hold(settings, context, monkeypatch):
+    strategy = MomentumBookImbalanceStrategy(settings)
+    hold = Signal(
+        action=SignalAction.HOLD,
+        confidence=0.99,
+        reason="negative edge",
+    )
+    buy = Signal(
+        action=SignalAction.BUY_DOWN,
+        confidence=0.80,
+        reason="positive EV momentum/book decision",
+        size_usdc=0.75,
+    )
+    monkeypatch.setattr(strategy, "_candidate", lambda action, book, ctx: hold if action == SignalAction.BUY_UP else buy)
+    monkeypatch.setattr(strategy, "_failed_gates", lambda ctx: [])
+    settings.enable_experimental_strategy = True
+
+    signal = strategy.evaluate(context)
+
+    assert signal.action == SignalAction.BUY_DOWN
 
 
 def test_strategy_blocks_5m_below_scout_probability_gate(settings, context):

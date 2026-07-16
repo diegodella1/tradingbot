@@ -24,6 +24,13 @@ class MomentumBookImbalanceStrategy(Strategy):
         self.model: ProbabilityModel | None = model if model is not None and model.is_compatible() else None
 
     def evaluate(self, context: MarketContext) -> Signal:
+        signal = self._evaluate_primary(context)
+        metadata = dict(signal.metadata or {})
+        metadata["primary_reason"] = signal.reason
+        metadata["failed_gates"] = self._failed_gates(context)
+        return signal.model_copy(update={"metadata": metadata})
+
+    def _evaluate_primary(self, context: MarketContext) -> Signal:
         if not self.settings.enable_experimental_strategy:
             return self._hold("experimental strategy disabled", context)
         if not context.market.is_tradeable:
@@ -50,7 +57,115 @@ class MomentumBookImbalanceStrategy(Strategy):
 
         up = self._candidate(SignalAction.BUY_UP, context.up_book, context)
         down = self._candidate(SignalAction.BUY_DOWN, context.down_book, context)
-        return max([up, down], key=lambda signal: signal.confidence)
+        # A high-confidence HOLD (for example, expensive side with negative edge)
+        # must never suppress an executable positive-EV candidate on the other side.
+        return max(
+            [up, down],
+            key=lambda signal: (signal.action != SignalAction.HOLD, signal.confidence),
+        )
+
+    def _failed_gates(self, context: MarketContext) -> list[str]:
+        """Return all failed safety/edge gates without changing primary decision.
+
+        Production historically stored only the first rejection. That made a large
+        `too_close` count look actionable even when the same candidate also had
+        negative edge. Diagnostics evaluate both sides independently so tuning can
+        use a real funnel instead of guessing from first-failure telemetry.
+        """
+        failures: list[str] = []
+        market_type = context.market.market_type.value
+        if not self.settings.enable_experimental_strategy:
+            failures.append("strategy.experimental_disabled")
+        if not context.market.is_tradeable:
+            failures.append("market.not_tradeable")
+        if not context.up_book or not context.down_book:
+            failures.append("market.missing_order_book")
+        max_age = 3 if market_type == "5m" else 5
+        if not context.btc.is_fresh(max_age):
+            failures.append("feed.stale_btc")
+        min_seconds = self.settings.minimum_seconds_to_close_for(market_type)
+        if context.market.seconds_to_close is None or context.market.seconds_to_close < min_seconds:
+            failures.append("market.too_close")
+        if context.btc.realized_volatility > self.settings.max_realized_volatility:
+            failures.append("market.volatility_extreme")
+        if self.settings.min_abs_change_since_open > 0 and abs(context.btc.change_since_open) < self.settings.min_abs_change_since_open:
+            failures.append("market.move_too_small")
+        if context.up_book:
+            failures.extend(self._candidate_failed_gates("UP", SignalAction.BUY_UP, context.up_book, context))
+        if context.down_book:
+            failures.extend(self._candidate_failed_gates("DOWN", SignalAction.BUY_DOWN, context.down_book, context))
+        return failures
+
+    def _candidate_failed_gates(
+        self,
+        side: str,
+        action: SignalAction,
+        book: OrderBook,
+        context: MarketContext,
+    ) -> list[str]:
+        prefix = f"{side}."
+        failures: list[str] = []
+        market_type = context.market.market_type.value
+        if market_type == "5m" and not self.settings.enable_5m_scout:
+            failures.append(prefix + "scout_disabled")
+        ask = book.best_ask
+        if ask is None:
+            return failures + [prefix + "missing_ask"]
+        if ask < self.settings.minimum_entry_price_for(market_type) or ask > self.settings.max_entry_price:
+            failures.append(prefix + "price_outside_band")
+        if book.spread is None or book.spread * 100 > self.settings.max_spread_cents:
+            failures.append(prefix + "spread_too_wide")
+        if book.top_liquidity_usdc < self.settings.min_orderbook_liquidity_usdc:
+            failures.append(prefix + "insufficient_liquidity")
+
+        wants_up = action == SignalAction.BUY_UP
+        direction = 1 if wants_up else -1
+        momentum_15 = direction * context.btc.momentum_15s
+        momentum_60 = direction * context.btc.momentum_60s
+        open_move = direction * context.btc.change_since_open
+        book_support = direction * book.imbalance
+        if momentum_15 <= 0 or momentum_60 <= 0 or open_move <= 0:
+            failures.append(prefix + "momentum_not_aligned")
+        if book_support < self.settings.minimum_book_imbalance_for(market_type):
+            failures.append(prefix + "book_not_supportive")
+
+        probability, _ = self._estimate_probability(context, book, ask, direction)
+        min_probability, min_net_edge_cents = self.settings.price_bucket_requirements(market_type, ask)
+        if probability < min_probability:
+            failures.append(prefix + "probability_below_minimum")
+        edge_cents = (probability - ask) * 100
+        shares = 1 / ask if ask > 0 else 0.0
+        fee = (
+            polymarket_taker_fee_usdc(shares, ask, self.settings.paper_taker_fee_rate)
+            if shares > 0 and self.settings.paper_enable_fees
+            else 0.0
+        )
+        break_even = (1 + fee) / shares if shares > 0 else 1.0
+        net_edge_cents = (probability - break_even) * 100
+        confidence = max(0.0, min(1.0, abs(probability - 0.5) * 2 + max(0.0, book_support)))
+        if confidence < self.settings.minimum_confidence_for(market_type):
+            failures.append(prefix + "confidence_below_minimum")
+        if edge_cents < self.settings.min_edge_cents:
+            failures.append(prefix + "edge_below_minimum")
+        if net_edge_cents < min_net_edge_cents:
+            failures.append(prefix + "net_edge_below_minimum")
+        max_trade_size = min(
+            self.settings.max_position_usdc,
+            self.settings.max_market_position_usdc,
+            self.settings.paper_bankroll_usdc * self.settings.max_trade_pct_for(market_type),
+        )
+        recommended_size = min(
+            self.settings.size_tier_usdc(probability, net_edge_cents),
+            max_trade_size,
+            self.settings.paper_bankroll_usdc
+            * kelly_fraction(probability, ask)
+            * self.settings.kelly_fraction_multiplier,
+        )
+        if recommended_size < self.settings.min_kelly_size_usdc:
+            failures.append(prefix + "kelly_below_minimum")
+        if 0.47 <= ask <= 0.53 and confidence < 0.85:
+            failures.append(prefix + "near_even_low_confidence")
+        return failures
 
     def _candidate(self, action: SignalAction, book: OrderBook, context: MarketContext) -> Signal:
         market_type = context.market.market_type.value

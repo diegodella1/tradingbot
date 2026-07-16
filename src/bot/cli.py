@@ -13,7 +13,10 @@ from bot.backtest import (
     bucket_breakdown,
     build_training_rows,
     load_samples,
+    policy_config,
+    policy_evidence,
     recommend,
+    recommend_policy,
     recommended_env_lines,
     run_backtest,
     run_walk_forward_sweep,
@@ -142,7 +145,7 @@ def backtest(
     if buckets:
         _print_buckets(samples, settings, size)
     if sweep:
-        _print_sweep(training_rows, settings, target_wr)
+        _print_sweep(training_rows, settings)
 
 
 def _print_buckets(samples, settings: Settings, size: float) -> None:
@@ -159,12 +162,20 @@ def _print_buckets(samples, settings: Settings, size: float) -> None:
             typer.echo(f"  {row['bucket']}: n={row['n']} WR={_fmt_pct(row['win_rate'])} pnl={row['pnl_usdc']:+.2f}")
 
 
-def _print_sweep(training_rows, settings: Settings, target_wr: float) -> None:
+def _print_sweep(training_rows, settings: Settings) -> None:
     if not training_rows:
         typer.echo("sweep: no hay decisiones con outcome verificado en la base")
         raise typer.Exit(1)
     try:
-        report = run_walk_forward_sweep(training_rows, settings.paper_taker_fee_rate)
+        report = run_walk_forward_sweep(
+            training_rows,
+            settings.paper_taker_fee_rate,
+            min_probabilities=(0.65, 0.70, 0.75, 0.80, 0.85),
+            min_seconds=(180, 300, 420, 600),
+            price_bands=((0.55, 0.69), (0.60, 0.69), (0.65, 0.69), (0.55, 0.90)),
+            min_net_edges=(5.0, 8.0, 10.0, 12.0),
+            settings=settings,
+        )
     except ValueError as exc:
         typer.echo(f"sweep: {exc}")
         raise typer.Exit(1) from exc
@@ -184,20 +195,25 @@ def _print_sweep(training_rows, settings: Settings, target_wr: float) -> None:
         )
         typer.echo(
             f"  p>={cell.min_probability} sec>={cell.min_seconds_to_close} "
-            f"banda={cell.price_band[0]}-{cell.price_band[1]} solo15m={cell.only_15m} | "
-            f"OOS n={cell.trades} WR={_fmt_pct(cell.win_rate)} pnl={cell.pnl_usdc:+.2f} | {in_sample}"
+            f"banda={cell.price_band[0]}-{cell.price_band[1]} net>={cell.min_net_edge_cents}c "
+            f"solo15m={cell.only_15m} | OOS n={cell.trades} WR={_fmt_pct(cell.win_rate)} "
+            f"pnl={cell.pnl_usdc:+.2f} freq={cell.trades_per_day:.1f}/d | {in_sample}"
         )
-    best = recommend(report["test_cells"], target_win_rate=target_wr, min_trades=10)
+    best = recommend_policy(report["test_cells"], min_trades=20)
     if best is None:
-        typer.echo(f"- sin recomendacion: ninguna celda cumple WR>={target_wr:.0%} out-of-sample con trades suficientes")
+        typer.echo("- sin recomendacion: ninguna celda 15m cumple PnL/PF/drawdown/ventanas y frecuencia 2-6/d")
         return
-    typer.echo(f"- recomendado por OOS (WR={_fmt_pct(best.win_rate)}, n={best.trades}, pnl={best.pnl_usdc:+.2f}); lineas .env:")
+    typer.echo(
+        f"- recomendado por OOS (WR={_fmt_pct(best.win_rate)}, n={best.trades}, "
+        f"pnl={best.pnl_usdc:+.2f}, PF={best.profit_factor:.2f}, DD={best.max_drawdown_pct:.1%}, "
+        f"freq={best.trades_per_day:.1f}/d); lineas .env:"
+    )
     for line in recommended_env_lines(best):
         typer.echo(f"  {line}")
 
 
 def _cell_key(cell) -> tuple:
-    return (cell.min_probability, cell.min_seconds_to_close, cell.price_band, cell.only_15m)
+    return (cell.min_probability, cell.min_seconds_to_close, cell.price_band, cell.min_net_edge_cents, cell.only_15m)
 
 
 @app.command()
@@ -435,6 +451,64 @@ def learning_report(persist: bool = typer.Option(True, help="Persist generated r
     for item in report["recommendations"]:
         typer.echo(f"  [{item['status']}] {item['scope']} / {item['metric']}: {item['recommendation']}")
         typer.echo(f"    sample={item['sample_size']} confidence={float(item['confidence']):.2f} reason={item['rationale']}")
+
+
+@app.command("policy-optimize")
+def policy_optimize(
+    version: str = typer.Option("btc-updown-v4-oos-15m", help="Immutable candidate version."),
+    register: bool = typer.Option(False, help="Register and auto-activate the eligible candidate in paper."),
+    evidence_output: Path | None = typer.Option(None, help="Evidence JSON path."),
+) -> None:
+    """Select a full-gate 15m policy targeting 2-6 paper entries/day."""
+    settings = _settings()
+    with connect(settings.sqlite_path) as conn:
+        training_rows = build_training_rows(conn)
+    if not training_rows:
+        typer.echo("no verified training rows")
+        raise typer.Exit(1)
+    report = run_walk_forward_sweep(
+        training_rows,
+        settings.paper_taker_fee_rate,
+        min_probabilities=(0.65, 0.70, 0.75, 0.80, 0.85),
+        min_seconds=(180, 300, 420, 600),
+        price_bands=((0.55, 0.69), (0.60, 0.69), (0.65, 0.69), (0.55, 0.90)),
+        min_net_edges=(5.0, 8.0, 10.0, 12.0),
+        settings=settings,
+    )
+    best = recommend_policy(report["test_cells"], min_trades=20)
+    if best is None:
+        typer.echo("no eligible policy: OOS safety/frequency gates failed")
+        raise typer.Exit(1)
+    config = policy_config(best)
+    evidence = policy_evidence(best, report)
+    destination = evidence_output or Path("artifacts/policy-evidence") / f"{version}.json"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    evidence_bytes = (json.dumps(evidence, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    destination.write_bytes(evidence_bytes)
+    typer.echo(
+        f"eligible {version}: n={best.trades} pnl={best.pnl_usdc:+.2f} "
+        f"PF={best.profit_factor:.2f} DD={best.max_drawdown_pct:.1%} freq={best.trades_per_day:.1f}/d"
+    )
+    typer.echo(f"config={json.dumps(config, sort_keys=True)}")
+    typer.echo(f"evidence={destination}")
+    if not register:
+        return
+    model_path = settings.probability_model_path
+    model_sha256 = hashlib.sha256(model_path.read_bytes()).hexdigest() if model_path.exists() else None
+    with connect(settings.sqlite_path) as conn:
+        register_candidate(
+            conn,
+            version,
+            config,
+            evidence,
+            evidence_sha256=hashlib.sha256(evidence_bytes).hexdigest(),
+            model_sha256=model_sha256,
+        )
+        decision = auto_promote_best_candidate(conn, settings)
+    if decision is None or decision.status != "paper_active":
+        typer.echo(f"candidate registered but not activated: {decision.reason if decision else 'not eligible'}")
+        raise typer.Exit(1)
+    typer.echo(f"paper activation: {decision.reason}")
 
 
 @app.command("policy-register")

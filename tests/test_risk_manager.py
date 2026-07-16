@@ -99,6 +99,15 @@ def test_hourly_trade_limit_blocks_trading(settings, context):
     assert "hourly trade limit" in decision.reason
 
 
+def test_daily_trade_limit_blocks_trading(settings, context):
+    settings.max_trades_per_hour = 100
+    settings.max_trades_per_day = 6
+    risk = RiskManager(settings, RiskState(trades_today=6))
+    decision = risk.validate(buy_signal(), context)
+    assert decision.approved is False
+    assert "daily trade limit" in decision.reason
+
+
 def test_break_even_guard_blocks_financially_bad_signal(settings, context):
     signal = Signal(
         action=SignalAction.BUY_UP,

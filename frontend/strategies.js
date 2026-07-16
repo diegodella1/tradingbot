@@ -20,6 +20,14 @@ const fmtCents = (value) => {
   return `${(Number(value) * 100).toFixed(2)}c`;
 };
 
+const fmtAge = (hours) => {
+  if (hours === null || hours === undefined || Number.isNaN(Number(hours))) return "never";
+  const value = Number(hours);
+  if (value < 1) return `${Math.round(value * 60)}m ago`;
+  if (value < 48) return `${value.toFixed(1)}h ago`;
+  return `${(value / 24).toFixed(1)}d ago`;
+};
+
 function byType(markets, type) {
   return (markets || []).find((market) => market.type === type || market.market_type === type);
 }
@@ -203,8 +211,13 @@ function renderTimeframes(rows) {
 function renderExecution(execution) {
   if (!$("#executionFunnel")) return;
   const stats = execution || {};
-  $("#executionSummary").textContent = `${stats.window || "12h"} · latest fill ${stats.latest_fill_at || "--"} · open exposure ${fmtUsd(stats.open_exposure_usdc || 0)}`;
-  $("#executionWarning").textContent = stats.stale_risk_warning ? "stale risk suspected" : "";
+  const target = stats.target_entries_per_day || {};
+  const btc = stats.feed_health?.btc || {};
+  $("#executionSummary").textContent = `${stats.window || "24h"} · last entry ${fmtAge(stats.hours_since_latest_fill)} · target ${target.min || 2}–${target.max || 6}/day · BTC ${btc.source || "unknown"} ${fmtNum(btc.age_seconds, 1)}s · open ${fmtUsd(stats.open_exposure_usdc || 0)}`;
+  const warnings = [];
+  if (stats.stale_risk_warning) warnings.push("stale risk suspected");
+  if (!btc.fresh) warnings.push("BTC feed stale");
+  $("#executionWarning").textContent = warnings.join(" · ");
   const items = [
     ["Decisions", stats.decisions || 0],
     ["Signal Candidates", stats.signal_candidates || 0],
@@ -217,10 +230,21 @@ function renderExecution(execution) {
       <div class="font-data text-2xl text-on-surface mt-1">${value}</div>
     </div>
   `).join("");
-  $("#executionBlocks").innerHTML = (stats.top_blocks || []).map((block) => `
+  const gateBlocks = (stats.top_gate_failures || []).map((block) => ({
+    label: block.gate,
+    count: block.count,
+    detail: fmtPct(block.share),
+  }));
+  const riskBlocks = (stats.top_blocks || []).map((block) => ({
+    label: `risk: ${block.reason}`,
+    count: block.count,
+    detail: "primary",
+  }));
+  $("#executionBlocks").innerHTML = [...gateBlocks, ...riskBlocks].slice(0, 12).map((block) => `
     <div class="bg-surface-container-low/60 p-3 rounded-lg border border-outline-variant/20">
-      <div class="text-xs text-outline uppercase tracking-wide">${block.reason}</div>
+      <div class="text-xs text-outline uppercase tracking-wide">${block.label}</div>
       <div class="font-data text-lg text-on-surface">${block.count}</div>
+      <div class="text-xs text-on-surface-variant">${block.detail}</div>
     </div>
   `).join("");
 }

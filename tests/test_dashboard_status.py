@@ -20,6 +20,9 @@ def test_status_payload_has_dashboard_contract(settings, monkeypatch):
     assert "performance" in payload
     assert "execution" in payload
     assert "signal_candidates" in payload["execution"]
+    assert payload["execution"]["window"] == "24h"
+    assert payload["execution"]["target_entries_per_day"] == {"min": 2, "max": 6}
+    assert "feed_health" in payload["execution"]
     assert "rag_documents" in payload["counts"]
     assert any(item["name"] == "live trading" and item["ok"] for item in payload["safety"])
 

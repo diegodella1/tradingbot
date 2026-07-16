@@ -106,6 +106,15 @@ Backtest recorded signals, with out-of-sample gate sweep (model trained on the f
 python -m bot.cli backtest --buckets --sweep
 ```
 
+Generate a full-gate, 15m-only paper policy candidate targeting 2-6 entries/day.
+The command exits without registering anything unless OOS PnL, profit factor,
+drawdown, profitable-window and frequency gates all pass:
+
+```bash
+python -m bot.cli policy-optimize --version btc-updown-v4-oos-15m
+python -m bot.cli policy-optimize --version btc-updown-v4-oos-15m --register
+```
+
 Train the calibrated probability model:
 
 ```bash

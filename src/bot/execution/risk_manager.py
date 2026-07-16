@@ -19,6 +19,7 @@ class RiskState:
     regime_healthy: bool = True
     regime_blocked: bool = False
     trades_last_hour: int = 0
+    trades_today: int = 0
     recent_5m_pnl_usdc: float = 0.0
     recent_5m_settled_count: int = 0
     recent_pnl_usdc: float = 0.0
@@ -55,6 +56,8 @@ class RiskManager:
             return RiskDecision(False, "websocket disconnected")
         if self.settings.max_trades_per_hour > 0 and self.state.trades_last_hour >= self.settings.max_trades_per_hour:
             return RiskDecision(False, "hourly trade limit hit")
+        if self.settings.max_trades_per_day > 0 and self.state.trades_today >= self.settings.max_trades_per_day:
+            return RiskDecision(False, "daily trade limit hit")
         if context.market.market_type.value == "5m":
             if not self.settings.enable_5m_scout:
                 return RiskDecision(False, "5m scout disabled")
@@ -156,6 +159,7 @@ class RiskManager:
             self.state.token_exposure[token_id] = self.state.token_exposure.get(token_id, 0.0) + size_usdc
         self.state.trades_by_market[market_id] = self.state.trades_by_market.get(market_id, 0) + 1
         self.state.trades_last_hour += 1
+        self.state.trades_today += 1
 
 
 def _float_metadata(signal: Signal, key: str) -> float | None:

@@ -127,6 +127,7 @@ def test_hydrate_populates_frequency_and_5m_loss_state(settings):
         state = Repository(conn).hydrate_risk_state()
 
     assert state.trades_last_hour == 3
+    assert state.trades_today == 3
     assert state.recent_5m_settled_count == 2
     assert round(state.recent_5m_pnl_usdc, 2) == -2.2
     assert state.recent_settled_count == 3

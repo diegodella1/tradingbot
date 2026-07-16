@@ -29,6 +29,7 @@ PAPER_CONFIG_KEYS = {
     "min_seconds_to_close_5m",
     "min_seconds_to_close_15m",
     "max_trades_per_hour",
+    "max_trades_per_day",
     "paper_trade_size_usdc",
 }
 

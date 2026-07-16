@@ -15,6 +15,7 @@ probability_model.json
 probability_model.candidate.json
 probability_model.rejected.json
 logs/
+artifacts/
 frontend/downloads/
 
 .agents/

@@ -356,9 +356,13 @@ class Repository:
         return state
 
     def _apply_frequency_risk_state(self, state: RiskState) -> None:
-        hour_ago = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
+        now = datetime.now(UTC)
+        hour_ago = (now - timedelta(hours=1)).isoformat()
         row = self.conn.execute("SELECT COUNT(*) FROM orders WHERE created_at >= ?", (hour_ago,)).fetchone()
         state.trades_last_hour = int(row[0] or 0)
+        day_start = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+        row = self.conn.execute("SELECT COUNT(*) FROM orders WHERE created_at >= ?", (day_start,)).fetchone()
+        state.trades_today = int(row[0] or 0)
 
         recent_5m = self.conn.execute(
             """

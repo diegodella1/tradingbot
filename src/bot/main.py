@@ -18,7 +18,7 @@ from bot.monitoring.alerts import send_alert
 from bot.monitoring.regime import regime_snapshot
 from bot.polymarket.clob import ClobClient
 from bot.polymarket.gamma import GammaClient, rejection_reason
-from bot.polymarket.models import MarketContext, OutcomeSide, SignalAction
+from bot.polymarket.models import BtcMarketState, MarketContext, OutcomeSide, SignalAction
 from bot.polymarket.realtime import RealtimeMarketData
 from bot.storage.db import connect, init_db, refresh_settlements
 from bot.storage.repositories import Repository
@@ -140,12 +140,8 @@ def _acquire_paper_loop_lock(sqlite_path: Path) -> FileLock:
 async def _paper_cycle(settings: Settings, gamma, clob, btc_feed, broker, risk, strategy, repo: Repository, log, realtime: RealtimeMarketData | None = None) -> None:
     _sync_risk_state(settings, repo, risk)
     try:
-        if realtime is not None and btc_feed.current_price is not None:
-            btc_state = btc_feed.state  # streamed price
-            _track_feed_degradation(settings, repo, realtime, using_rest=False)
-        else:
-            btc_state = await btc_feed.poll_once()  # REST fallback (or until WS warms up)
-            _track_feed_degradation(settings, repo, realtime, using_rest=True)
+        btc_state, btc_source = await _btc_state_for_cycle(settings, btc_feed, realtime)
+        _track_feed_degradation(settings, repo, realtime, using_rest=btc_source == "rest")
         if btc_state.current_price is not None:
             repo.save_btc_tick(btc_state.current_price)
     except Exception as exc:
@@ -184,8 +180,11 @@ async def _paper_cycle(settings: Settings, gamma, clob, btc_feed, broker, risk, 
         try:
             up_token = market.tokens[OutcomeSide.UP].token_id
             down_token = market.tokens[OutcomeSide.DOWN].token_id
-            up_book = (realtime.get_book(up_token) if realtime else None) or await clob.get_order_book(up_token, market.market_id)
-            down_book = (realtime.get_book(down_token) if realtime else None) or await clob.get_order_book(down_token, market.market_id)
+            streamed_up = realtime.get_book(up_token) if realtime else None
+            streamed_down = realtime.get_book(down_token) if realtime else None
+            up_book = streamed_up or await clob.get_order_book(up_token, market.market_id)
+            down_book = streamed_down or await clob.get_order_book(down_token, market.market_id)
+            book_source = "websocket" if streamed_up and streamed_down else ("mixed" if streamed_up or streamed_down else "rest")
             repo.save_snapshot(up_book)
             repo.save_snapshot(down_book)
         except Exception as exc:
@@ -229,6 +228,8 @@ async def _paper_cycle(settings: Settings, gamma, clob, btc_feed, broker, risk, 
                 "up_ask": up_book.best_ask,
                 "down_bid": down_book.best_bid,
                 "down_ask": down_book.best_ask,
+                "book_source": book_source,
+                "book_fresh": True,
                 "signal": signal.model_dump(mode="json"),
                 "risk": decision.reason,
                 "order": order.model_dump(mode="json") if order else None,
@@ -243,10 +244,38 @@ async def _paper_cycle(settings: Settings, gamma, clob, btc_feed, broker, risk, 
             "status": "ok" if any_market else "no_market",
             "mode": "paper",
             "strategy": strategy.__class__.__name__,
-            "btc": btc_state.model_dump(mode="json"),
+            "btc": btc_state.model_dump(mode="json")
+            | {
+                "source": btc_source,
+                "age_seconds": _btc_age_seconds(btc_state),
+                "websocket_connected": bool(realtime and realtime.btc_connected),
+            },
             "markets": state_markets,
         },
     )
+
+
+async def _btc_state_for_cycle(
+    settings: Settings,
+    btc_feed: CoinbaseBtcFeed,
+    realtime: RealtimeMarketData | None,
+) -> tuple[BtcMarketState, str]:
+    """Use streamed BTC only while fresh; otherwise refresh through REST.
+
+    A disconnected Coinbase socket can retain its last in-memory price forever.
+    Checking only ``current_price`` therefore turns a recoverable disconnect into
+    permanent HOLDs. Freshness, not mere presence, selects the data source.
+    """
+    streamed = btc_feed.state
+    max_age = 3.0 if settings.enable_5m_scout and "5m" in settings.market_types else 5.0
+    if realtime is not None and streamed.current_price is not None and streamed.is_fresh(max_age):
+        return streamed, "websocket"
+    return await btc_feed.poll_once(), "rest"
+
+def _btc_age_seconds(state: BtcMarketState) -> float | None:
+    if state.price_timestamp is None:
+        return None
+    return max(0.0, (datetime.now(UTC) - state.price_timestamp).total_seconds())
 
 
 def _track_feed_degradation(settings: Settings, repo: Repository, realtime: RealtimeMarketData | None, using_rest: bool) -> None:
@@ -284,7 +313,9 @@ async def _apply_realtime_state(realtime: RealtimeMarketData | None, discovered,
             tokens.append(market.tokens[OutcomeSide.DOWN].token_id)
     with suppress(Exception):
         await realtime.ensure_subscription(tokens)
-    risk.state.websocket_connected = realtime.connected
+    # Paper can safely use the REST books fetched by `_paper_cycle`; live remains
+    # fail-closed unless the market websocket itself is connected.
+    risk.state.websocket_connected = realtime.market_connected or not risk.settings.enable_live_trading
 
 
 def _maybe_exit_position(settings: Settings, market, context, strategy, broker, risk, repo: Repository, log) -> None:

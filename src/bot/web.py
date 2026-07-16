@@ -951,12 +951,20 @@ def _performance(conn: sqlite3.Connection, settings, positions: list[dict] | Non
 
 
 def _execution_stats(conn: sqlite3.Connection) -> dict:
-    cutoff = (datetime.now(UTC) - timedelta(hours=12)).isoformat()
+    now = datetime.now(UTC)
+    cutoff = (now - timedelta(hours=24)).isoformat()
     decisions = conn.execute("SELECT COUNT(*) FROM strategy_decisions WHERE created_at >= ?", (cutoff,)).fetchone()[0]
     candidates = conn.execute("SELECT COUNT(*) FROM strategy_decisions WHERE created_at >= ? AND action != 'HOLD'", (cutoff,)).fetchone()[0]
     approved = conn.execute("SELECT COUNT(*) FROM risk_events WHERE created_at >= ? AND approved = 1", (cutoff,)).fetchone()[0]
     fills = conn.execute("SELECT COUNT(*) FROM fills WHERE created_at >= ?", (cutoff,)).fetchone()[0]
     latest_fill = conn.execute("SELECT created_at FROM fills ORDER BY created_at DESC LIMIT 1").fetchone()
+    latest_fill_at = latest_fill["created_at"] if latest_fill else None
+    hours_since_latest_fill = None
+    if latest_fill_at:
+        try:
+            hours_since_latest_fill = max(0.0, (now - datetime.fromisoformat(latest_fill_at.replace("Z", "+00:00"))).total_seconds() / 3600)
+        except ValueError:
+            pass
     open_positions = conn.execute(
         """
         SELECT COUNT(*), COALESCE(SUM(size_usdc), 0)
@@ -983,16 +991,51 @@ def _execution_stats(conn: sqlite3.Connection) -> dict:
         ).fetchall()
     ]
     stale_risk = any(row["reason"] == "one open position limit hit" for row in top_blocks) and int(open_positions[0] or 0) == 0
+    gate_counts: dict[str, int] = {}
+    metadata_rows = conn.execute(
+        "SELECT metadata_json FROM strategy_decisions WHERE created_at >= ?",
+        (cutoff,),
+    ).fetchall()
+    for row in metadata_rows:
+        try:
+            metadata = json.loads(row["metadata_json"] or "{}")
+        except json.JSONDecodeError:
+            continue
+        for gate in set(metadata.get("failed_gates") or []):
+            gate_counts[str(gate)] = gate_counts.get(str(gate), 0) + 1
+    top_gate_failures = [
+        {"gate": gate, "count": count, "share": count / decisions if decisions else 0.0}
+        for gate, count in sorted(gate_counts.items(), key=lambda item: (-item[1], item[0]))[:12]
+    ]
+    loop_state = _state(conn, "paper_loop")
+    btc_state = loop_state.get("btc") or {}
+    markets_state = loop_state.get("markets") or []
+    book_sources: dict[str, int] = {}
+    for market in markets_state:
+        source = str(market.get("book_source") or "unknown")
+        book_sources[source] = book_sources.get(source, 0) + 1
     return {
-        "window": "12h",
+        "window": "24h",
+        "target_entries_per_day": {"min": 2, "max": 6},
         "decisions": int(decisions or 0),
         "signal_candidates": int(candidates or 0),
         "risk_approved": int(approved or 0),
         "paper_fills": int(fills or 0),
-        "latest_fill_at": latest_fill["created_at"] if latest_fill else None,
+        "latest_fill_at": latest_fill_at,
+        "hours_since_latest_fill": hours_since_latest_fill,
         "open_positions": int(open_positions[0] or 0),
         "open_exposure_usdc": float(open_positions[1] or 0),
         "top_blocks": top_blocks,
+        "top_gate_failures": top_gate_failures,
+        "feed_health": {
+            "btc": {
+                "source": btc_state.get("source", "unknown"),
+                "age_seconds": btc_state.get("age_seconds"),
+                "websocket_connected": bool(btc_state.get("websocket_connected")),
+                "fresh": isinstance(btc_state.get("age_seconds"), (int, float)) and float(btc_state["age_seconds"]) <= 5.0,
+            },
+            "books": {"sources": book_sources, "fresh": all(bool(item.get("book_fresh")) for item in markets_state if item.get("status") == "ok")},
+        },
         "stale_risk_warning": stale_risk,
     }
 
