@@ -992,6 +992,7 @@ def _execution_stats(conn: sqlite3.Connection) -> dict:
     ]
     stale_risk = any(row["reason"] == "one open position limit hit" for row in top_blocks) and int(open_positions[0] or 0) == 0
     gate_counts: dict[str, int] = {}
+    gate_telemetry_decisions = 0
     metadata_rows = conn.execute(
         "SELECT metadata_json FROM strategy_decisions WHERE created_at >= ?",
         (cutoff,),
@@ -1001,10 +1002,14 @@ def _execution_stats(conn: sqlite3.Connection) -> dict:
             metadata = json.loads(row["metadata_json"] or "{}")
         except json.JSONDecodeError:
             continue
-        for gate in set(metadata.get("failed_gates") or []):
+        failed_gates = metadata.get("failed_gates")
+        if not isinstance(failed_gates, list):
+            continue
+        gate_telemetry_decisions += 1
+        for gate in set(failed_gates):
             gate_counts[str(gate)] = gate_counts.get(str(gate), 0) + 1
     top_gate_failures = [
-        {"gate": gate, "count": count, "share": count / decisions if decisions else 0.0}
+        {"gate": gate, "count": count, "share": count / gate_telemetry_decisions if gate_telemetry_decisions else 0.0}
         for gate, count in sorted(gate_counts.items(), key=lambda item: (-item[1], item[0]))[:12]
     ]
     loop_state = _state(conn, "paper_loop")
@@ -1026,6 +1031,7 @@ def _execution_stats(conn: sqlite3.Connection) -> dict:
         "open_positions": int(open_positions[0] or 0),
         "open_exposure_usdc": float(open_positions[1] or 0),
         "top_blocks": top_blocks,
+        "gate_telemetry_decisions": gate_telemetry_decisions,
         "top_gate_failures": top_gate_failures,
         "feed_health": {
             "btc": {

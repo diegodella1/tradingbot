@@ -5,7 +5,7 @@ import json
 
 from bot import web
 from bot.storage.db import force_settle_pending_positions, init_db
-from bot.web import analytics_payload, force_settlements_payload, learning_payload, status_payload, strategies_payload, _btc_candles_1m
+from bot.web import _btc_candles_1m, _execution_stats, analytics_payload, force_settlements_payload, learning_payload, status_payload, strategies_payload
 
 
 def test_status_payload_has_dashboard_contract(settings, monkeypatch):
@@ -25,6 +25,28 @@ def test_status_payload_has_dashboard_contract(settings, monkeypatch):
     assert "feed_health" in payload["execution"]
     assert "rag_documents" in payload["counts"]
     assert any(item["name"] == "live trading" and item["ok"] for item in payload["safety"])
+
+
+def test_gate_failure_share_uses_only_decisions_with_gate_telemetry(settings):
+    init_db(settings.sqlite_path)
+    now = datetime.now(UTC).isoformat()
+    with __import__("sqlite3").connect(settings.sqlite_path) as raw_conn:
+        raw_conn.execute(
+            """
+            INSERT INTO strategy_decisions
+              (market_id, action, confidence, reason, metadata_json, created_at)
+            VALUES
+              ('legacy', 'HOLD', 0, 'legacy', '{}', ?),
+              ('new', 'HOLD', 0, 'new', ?, ?)
+            """,
+            (now, json.dumps({"failed_gates": ["feed.stale_btc"]}), now),
+        )
+        raw_conn.row_factory = __import__("sqlite3").Row
+        stats = _execution_stats(raw_conn)
+
+    assert stats["decisions"] == 2
+    assert stats["gate_telemetry_decisions"] == 1
+    assert stats["top_gate_failures"][0] == {"gate": "feed.stale_btc", "count": 1, "share": 1.0}
 
 
 def test_status_payload_uses_paper_state_btc_fallback(settings, monkeypatch):
