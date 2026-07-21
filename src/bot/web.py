@@ -613,6 +613,7 @@ def _read_connection(path: Path) -> sqlite3.Connection:
 def strategies_payload() -> dict:
     settings = get_settings()
     with closing(_read_connection(settings.sqlite_path)) as conn:
+        settings = apply_active_policy(settings, conn)
         counts = _table_counts(conn)
         latest_state = _state(conn, "paper_loop")
         markets = _state_markets(latest_state) or _latest_markets(conn)
@@ -693,6 +694,9 @@ def strategies_payload() -> dict:
             "paper_trade_size_usdc": settings.paper_trade_size_usdc,
             "paper_enable_fees": settings.paper_enable_fees,
             "paper_taker_fee_rate": settings.paper_taker_fee_rate,
+            "paper_order_style": settings.paper_order_style,
+            "paper_maker_fill_window_seconds": settings.paper_maker_fill_window_seconds,
+            "paper_max_trade_size_usdc": settings.paper_max_trade_size_usdc,
             "policy_version": settings.policy_version,
             "min_break_even_margin_cents": settings.min_break_even_margin_cents,
         },
