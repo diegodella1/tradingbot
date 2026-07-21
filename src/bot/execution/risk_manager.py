@@ -20,6 +20,7 @@ class RiskState:
     regime_blocked: bool = False
     trades_last_hour: int = 0
     trades_today: int = 0
+    losses_today: int = 0
     recent_5m_pnl_usdc: float = 0.0
     recent_5m_settled_count: int = 0
     recent_pnl_usdc: float = 0.0
@@ -108,6 +109,8 @@ class RiskManager:
             return RiskDecision(False, "total exposure limit hit")
         if self.state.daily_pnl_usdc <= -abs(self.settings.max_daily_loss_usdc):
             return RiskDecision(False, "daily loss limit hit")
+        if self.settings.paper_experiment_enabled and self.state.losses_today >= 2:
+            return RiskDecision(False, "paper experiment stopped after two losses today")
         now = datetime.now(UTC)
         size_multiplier = 1.0
         if (

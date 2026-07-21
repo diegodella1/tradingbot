@@ -26,12 +26,14 @@ from bot.knowledge.rag import index_markdown, search
 from bot.strategy.calibration import accuracy, fit_logistic, log_loss, walk_forward
 from bot.learning.policy import generate_learning_report, persist_learning_recommendations
 from bot.learning.versions import (
+    activate_paper_experiment,
     apply_active_policy,
     auto_promote_best_candidate,
     ensure_baseline_policy,
     evaluate_and_transition,
     list_policies,
     register_candidate,
+    rollback_paper_experiment,
 )
 from bot.live_loop import run_live_loop
 from bot.main import configure_logging, run_paper_loop
@@ -565,6 +567,26 @@ def policy_status(evaluate: bool = typer.Option(False, help="Evaluate and transi
             f"{item['version']} status={item['status']} trades={metrics.get('trades', 0)} "
             f"pnl={float(metrics.get('pnl_usdc') or 0):+.2f} drawdown={_fmt_pct(metrics.get('max_drawdown_pct'))}"
         )
+
+
+@app.command("policy-experiment-activate")
+def policy_experiment_activate(version: str = typer.Option(..., help="Registered maker experiment version.")) -> None:
+    """Explicitly activate a guarded maker policy in paper; live must remain off."""
+    settings = _settings()
+    with connect(settings.sqlite_path) as conn:
+        decision = activate_paper_experiment(conn, version, settings)
+    typer.echo(f"{version}: {decision.status} - {decision.reason}")
+    if decision.status != "paper_active":
+        raise typer.Exit(1)
+
+
+@app.command("policy-experiment-rollback")
+def policy_experiment_rollback(version: str = typer.Option(..., help="Maker experiment version to stop.")) -> None:
+    """Stop the experiment, cancel its pending maker orders and restore the prior policy."""
+    settings = _settings()
+    with connect(settings.sqlite_path) as conn:
+        restored = rollback_paper_experiment(conn, version)
+    typer.echo(f"stopped {version}; restored={restored or 'none'}")
 
 
 def _fmt_pct(value) -> str:

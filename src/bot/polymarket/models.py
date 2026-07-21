@@ -176,6 +176,8 @@ class OrderRecord(BaseModel):
     status: OrderStatus
     filled_size_usdc: float = 0.0
     avg_fill_price: float | None = None
+    execution_style: str = "taker"
+    expires_at: datetime | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 

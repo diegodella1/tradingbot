@@ -16,6 +16,7 @@ from bot.execution.paper_broker import PaperBroker
 from bot.execution.risk_manager import RiskManager
 from bot.monitoring.alerts import send_alert
 from bot.monitoring.regime import regime_snapshot
+from bot.learning.versions import evaluate_and_transition
 from bot.polymarket.clob import ClobClient
 from bot.polymarket.gamma import GammaClient, rejection_reason
 from bot.polymarket.models import BtcMarketState, MarketContext, OutcomeSide, SignalAction
@@ -88,6 +89,7 @@ async def run_paper_loop(settings: Settings, max_cycles: int | None = None) -> N
             await realtime.start()
     with connect(settings.sqlite_path) as conn:
         repo = Repository(conn)
+        broker.hydrate_orders(repo.open_maker_orders())
         risk.state = repo.hydrate_risk_state(settings.loss_streak_window_minutes)
         try:
             while not stop.is_set():
@@ -138,6 +140,7 @@ def _acquire_paper_loop_lock(sqlite_path: Path) -> FileLock:
 
 
 async def _paper_cycle(settings: Settings, gamma, clob, btc_feed, broker, risk, strategy, repo: Repository, log, realtime: RealtimeMarketData | None = None) -> None:
+    _expire_or_cancel_stale_maker_orders(settings, broker, repo)
     _sync_risk_state(settings, repo, risk)
     try:
         btc_state, btc_source = await _btc_state_for_cycle(settings, btc_feed, realtime)
@@ -192,6 +195,9 @@ async def _paper_cycle(settings: Settings, gamma, clob, btc_feed, broker, risk, 
             state_markets.append({"type": market_type.value, "status": "book_error", "question": market.question})
             continue
 
+        if _reconcile_maker_orders_for_market(settings, market, up_book, down_book, broker, repo, log):
+            risk.state = repo.hydrate_risk_state(settings.loss_streak_window_minutes)
+
         market_open_price = (
             _market_open_price(repo, market, chainlink=realtime.chainlink if realtime else None)
             or btc_state.market_open_price
@@ -205,10 +211,12 @@ async def _paper_cycle(settings: Settings, gamma, clob, btc_feed, broker, risk, 
         order, decision = OrderManager(risk, broker).execute_paper_signal(signal, context)
         repo.save_risk_event(market.market_id, decision)
         if order:
-            repo.save_order(order)
-            for fill in broker.fills:
-                if fill.order_id == order.order_id:
-                    repo.save_fill(fill)
+            fills = [fill for fill in broker.fills if fill.order_id == order.order_id]
+            if fills:
+                for fill in fills:
+                    repo.save_order_and_fill(order, fill)
+            else:
+                repo.save_order(order)
         _maybe_exit_position(settings, market, context, strategy, broker, risk, repo, log)
         repo.save_learning_note(
             f"{market_type.value} {signal.action.value}: {decision.reason}; signal={signal.reason}",
@@ -253,6 +261,49 @@ async def _paper_cycle(settings: Settings, gamma, clob, btc_feed, broker, risk, 
             "markets": state_markets,
         },
     )
+
+
+def _expire_or_cancel_stale_maker_orders(settings: Settings, broker: PaperBroker, repo: Repository) -> None:
+    for order in list(broker.orders.values()):
+        if order.execution_style != "maker" or order.status.value not in {"OPEN", "PARTIALLY_FILLED"}:
+            continue
+        order_policy = (order.request.metadata or {}).get("policy_version")
+        if order_policy and order_policy != settings.policy_version:
+            broker.cancel_order(order.order_id, "policy changed; maker order canceled")
+            repo.save_order(order)
+            continue
+        updated, _ = broker.reconcile_maker_order(order, None)
+        if updated.status.value == "CANCELED":
+            repo.save_order(updated)
+
+
+def _reconcile_maker_orders_for_market(settings, market, up_book, down_book, broker, repo, log) -> bool:
+    books = {
+        market.tokens[OutcomeSide.UP].token_id: up_book,
+        market.tokens[OutcomeSide.DOWN].token_id: down_book,
+    }
+    changed = False
+    for order in list(broker.orders.values()):
+        if order.request.market_id != market.market_id or order.execution_style != "maker":
+            continue
+        before_status = order.status
+        before_filled = order.filled_size_usdc
+        updated, fill = broker.reconcile_maker_order(order, books.get(order.request.token_id))
+        if fill is not None:
+            repo.save_order_and_fill(updated, fill)
+            log.info(
+                "paper_maker_fill",
+                order_id=order.order_id,
+                market=market.question,
+                price=fill.price,
+                size_usdc=fill.size_usdc,
+                fee_usdc=0.0,
+            )
+        elif updated.status != before_status or updated.filled_size_usdc != before_filled:
+            repo.save_order(updated)
+        if updated.status != before_status or updated.filled_size_usdc != before_filled:
+            changed = True
+    return changed
 
 
 async def _btc_state_for_cycle(
@@ -364,9 +415,28 @@ def _sync_risk_state(settings: Settings, repo: Repository, risk: RiskManager) ->
 
 def _apply_regime_control(settings: Settings, repo: Repository, risk: RiskManager, previously_healthy: bool) -> None:
     """Compare rolling WR vs breakeven; alert on degradation, optionally stop entries."""
-    snapshot = regime_snapshot(repo.conn, settings.regime_window_trades, settings.regime_min_trades)
+    snapshot = regime_snapshot(
+        repo.conn,
+        settings.regime_window_trades,
+        settings.regime_min_trades,
+        policy_version=settings.policy_version,
+    )
+    experiment_stopped = False
+    if settings.paper_experiment_enabled:
+        active = repo.conn.execute(
+            "SELECT is_active FROM policy_versions WHERE version = ?",
+            (settings.policy_version,),
+        ).fetchone()
+        if not active or not bool(active["is_active"]):
+            experiment_stopped = True
+        else:
+            decision = evaluate_and_transition(repo.conn, settings.policy_version, settings)
+            experiment_stopped = decision.status == "stopped"
+            if experiment_stopped:
+                repo.save_health_event("paper_experiment", "stopped", decision.reason)
+                send_alert(settings, "paper_experiment_stopped", policy_version=settings.policy_version, reason=decision.reason)
     risk.state.regime_healthy = bool(snapshot["healthy"])
-    risk.state.regime_blocked = settings.enable_regime_stop and not snapshot["healthy"]
+    risk.state.regime_blocked = experiment_stopped or (settings.enable_regime_stop and not snapshot["healthy"])
     if not snapshot["evaluated"]:
         return
     detail = (

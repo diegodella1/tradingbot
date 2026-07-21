@@ -12,6 +12,7 @@ from bot.config import Settings
 
 
 PAPER_CONFIG_KEYS = {
+    "enable_experimental_strategy",
     "market_types",
     "enable_5m_scout",
     "min_confidence",
@@ -31,6 +32,20 @@ PAPER_CONFIG_KEYS = {
     "max_trades_per_hour",
     "max_trades_per_day",
     "paper_trade_size_usdc",
+    "paper_order_style",
+    "paper_maker_fill_window_seconds",
+    "paper_max_trade_size_usdc",
+    "paper_experiment_enabled",
+    "paper_experiment_stop_loss_usdc",
+    "paper_experiment_max_drawdown_pct",
+    "paper_experiment_min_fills",
+    "paper_experiment_min_profit_factor",
+    "paper_experiment_min_fill_rate",
+    "max_daily_loss_usdc",
+    "max_consecutive_losses",
+    "min_book_imbalance",
+    "min_kelly_size_usdc",
+    "max_trade_pct_15m",
 }
 
 
@@ -115,6 +130,46 @@ def evaluate_policy(conn: sqlite3.Connection, version: str, settings: Settings) 
         (version,),
     ).fetchall()
     metrics = policy_metrics(rows, settings.paper_bankroll_usdc)
+    policy_row = conn.execute("SELECT config_json FROM policy_versions WHERE version = ?", (version,)).fetchone()
+    config = json.loads(policy_row["config_json"] or "{}") if policy_row else {}
+    if config.get("paper_experiment_enabled"):
+        maker = conn.execute(
+            """
+            SELECT COUNT(*) AS attempts,
+                   COUNT(DISTINCT CASE WHEN EXISTS (
+                       SELECT 1 FROM fills f WHERE f.order_id = orders.order_id
+                   ) THEN order_id END) AS filled
+            FROM orders WHERE policy_version = ? AND execution_style = 'maker'
+            """,
+            (version,),
+        ).fetchone()
+        attempts = int(maker["attempts"] or 0)
+        filled = int(maker["filled"] or 0)
+        metrics["maker_attempts"] = attempts
+        metrics["maker_filled_orders"] = filled
+        metrics["maker_fill_rate"] = filled / attempts if attempts else None
+        hard_stop = (
+            metrics["pnl_usdc"] <= -abs(settings.paper_experiment_stop_loss_usdc)
+            or metrics["max_drawdown_pct"] >= settings.paper_experiment_max_drawdown_pct
+        )
+        mature_failures = []
+        if metrics["trades"] >= settings.paper_experiment_min_fills:
+            if metrics["pnl_usdc"] <= 0:
+                mature_failures.append("cumulative PnL is not positive")
+            if float(metrics["profit_factor"] or 0) < settings.paper_experiment_min_profit_factor:
+                mature_failures.append("profit factor below experiment floor")
+            if metrics["win_rate"] is None or metrics["breakeven_win_rate"] is None or metrics["win_rate"] <= metrics["breakeven_win_rate"]:
+                mature_failures.append("win rate does not beat break-even")
+            if float(metrics["maker_fill_rate"] or 0) < settings.paper_experiment_min_fill_rate:
+                mature_failures.append("maker fill rate below experiment floor")
+        if hard_stop or mature_failures:
+            reason = "; ".join(mature_failures) or "experiment hard loss/drawdown stop"
+            return PromotionDecision(status="stopped", reason=reason, metrics=metrics)
+        return PromotionDecision(
+            status="paper_active",
+            reason=f"collecting maker experiment fills {metrics['trades']}/{settings.paper_experiment_min_fills}",
+            metrics=metrics,
+        )
     reasons = _failed_gates(metrics, settings)
     if metrics["max_drawdown_pct"] > settings.policy_max_drawdown_pct:
         status = "stopped"
@@ -150,7 +205,74 @@ def evaluate_and_transition(conn: sqlite3.Connection, version: str, settings: Se
         ),
     )
     conn.commit()
+    if decision.status == "stopped":
+        _restore_previous_policy(conn, version)
     return decision
+
+
+def activate_paper_experiment(conn: sqlite3.Connection, version: str, settings: Settings) -> PromotionDecision:
+    """Explicitly activate a small, paper-only maker experiment below normal OOS gates."""
+    row = conn.execute(
+        "SELECT status, is_active, config_json, oos_metrics_json, evidence_sha256 FROM policy_versions WHERE version = ?",
+        (version,),
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"unknown policy version: {version}")
+    config = json.loads(row["config_json"] or "{}")
+    if row["status"] == "paper_active" and bool(row["is_active"]):
+        return PromotionDecision("paper_active", "paper-only maker experiment already active", json.loads(row["oos_metrics_json"] or "{}"))
+    if row["status"] != "candidate":
+        raise ValueError(f"policy {version} is {row['status']}, not candidate")
+    if settings.enable_live_trading:
+        return PromotionDecision("candidate", "paper experiment requires live trading disabled", {})
+    if settings.policy_require_evidence_hash and not row["evidence_sha256"]:
+        return PromotionDecision("candidate", "OOS evidence checksum is required", {})
+    if config.get("paper_order_style") != "maker" or not config.get("paper_experiment_enabled"):
+        return PromotionDecision("candidate", "explicit maker experiment config is required", {})
+    previous = active_policy(conn)
+    now = datetime.now(UTC).isoformat()
+    with conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO paper_state (key, value_json, updated_at) VALUES ('paper_experiment_previous_policy', ?, ?)",
+            (json.dumps({"version": previous["version"] if previous else None}), now),
+        )
+        conn.execute("UPDATE policy_versions SET is_active = 0 WHERE is_active = 1")
+        conn.execute(
+            "UPDATE policy_versions SET status='paper_active', is_active=1, activated_at=?, rejection_reason=NULL WHERE version=?",
+            (now, version),
+        )
+    return PromotionDecision("paper_active", "explicit paper-only maker experiment activated", json.loads(row["oos_metrics_json"] or "{}"))
+
+
+def _restore_previous_policy(conn: sqlite3.Connection, stopped_version: str) -> None:
+    state = conn.execute("SELECT value_json FROM paper_state WHERE key = 'paper_experiment_previous_policy'").fetchone()
+    if not state:
+        return
+    previous = json.loads(state["value_json"] or "{}").get("version")
+    if not previous or previous == stopped_version:
+        return
+    with conn:
+        conn.execute(
+            "UPDATE policy_versions SET is_active=1, status=CASE WHEN status='stopped' THEN 'paper_active' ELSE status END WHERE version=?",
+            (previous,),
+        )
+        conn.execute(
+            "UPDATE orders SET status='CANCELED', reason='experiment stopped; rollback', updated_at=? "
+            "WHERE policy_version=? AND execution_style='maker' AND status IN ('OPEN','PARTIALLY_FILLED')",
+            (datetime.now(UTC).isoformat(), stopped_version),
+        )
+
+
+def rollback_paper_experiment(conn: sqlite3.Connection, version: str, reason: str = "manual rollback") -> str | None:
+    now = datetime.now(UTC).isoformat()
+    with conn:
+        conn.execute(
+            "UPDATE policy_versions SET status='stopped', is_active=0, rejection_reason=?, evaluated_at=? WHERE version=?",
+            (reason, now, version),
+        )
+    _restore_previous_policy(conn, version)
+    active = active_policy(conn)
+    return active["version"] if active else None
 
 
 def activate_candidate(conn: sqlite3.Connection, version: str, settings: Settings) -> PromotionDecision:

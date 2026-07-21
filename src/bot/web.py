@@ -16,6 +16,7 @@ import httpx
 
 from bot.config import get_settings
 from bot.learning.policy import generate_learning_report
+from bot.learning.versions import apply_active_policy
 from bot.polymarket.gamma import convert_gamma_market, markets_from_event
 from bot.storage.db import force_settle_pending_positions, init_db
 from bot.storage.repositories import Repository
@@ -197,6 +198,7 @@ def _refresh_status_payload(cache_key: str) -> None:
 def _build_status_payload() -> dict:
     settings = get_settings()
     with closing(_read_connection(settings.sqlite_path)) as conn:
+        settings = apply_active_policy(settings, conn)
         counts = _table_counts(conn)
         latest_state = _state(conn, "paper_loop")
         activity = _recent_operations(conn)
@@ -224,6 +226,9 @@ def _build_status_payload() -> dict:
             "paper_trade_size_usdc": settings.paper_trade_size_usdc,
             "paper_enable_fees": settings.paper_enable_fees,
             "paper_taker_fee_rate": settings.paper_taker_fee_rate,
+            "paper_order_style": settings.paper_order_style,
+            "paper_maker_fill_window_seconds": settings.paper_maker_fill_window_seconds,
+            "paper_max_trade_size_usdc": settings.paper_max_trade_size_usdc,
             "min_edge_cents": settings.min_edge_cents,
             "max_spread_cents": settings.max_spread_cents,
             "min_orderbook_liquidity_usdc": settings.min_orderbook_liquidity_usdc,
@@ -991,6 +996,41 @@ def _execution_stats(conn: sqlite3.Connection) -> dict:
         ).fetchall()
     ]
     stale_risk = any(row["reason"] == "one open position limit hit" for row in top_blocks) and int(open_positions[0] or 0) == 0
+    active = conn.execute("SELECT version, config_json FROM policy_versions WHERE is_active = 1 LIMIT 1").fetchone()
+    policy_version = active["version"] if active else None
+    try:
+        active_config = json.loads(active["config_json"] or "{}") if active else {}
+    except json.JSONDecodeError:
+        active_config = {}
+    maker_active = active_config.get("paper_order_style") == "maker"
+    maker_where = "WHERE execution_style = 'maker'" + (" AND policy_version = ?" if policy_version else "")
+    maker_params = (policy_version,) if policy_version else ()
+    maker_orders = conn.execute(
+        f"""
+        SELECT COUNT(*) AS attempts,
+               SUM(CASE WHEN status = 'OPEN' THEN 1 ELSE 0 END) AS open_orders,
+               SUM(CASE WHEN status = 'CANCELED' THEN 1 ELSE 0 END) AS canceled_orders,
+               COUNT(DISTINCT CASE WHEN EXISTS (
+                   SELECT 1 FROM fills f WHERE f.order_id = orders.order_id
+               ) THEN order_id END) AS filled_orders
+        FROM orders {maker_where}
+        """,
+        maker_params,
+    ).fetchone()
+    maker_pnl_where = "WHERE status IN ('WON','LOST','CLOSED')" + (" AND policy_version = ?" if policy_version else "")
+    maker_pnls = conn.execute(
+        f"SELECT realized_pnl_usdc FROM positions {maker_pnl_where}",
+        maker_params,
+    ).fetchall()
+    maker_gross_profit = sum(max(0.0, float(row["realized_pnl_usdc"] or 0)) for row in maker_pnls)
+    maker_gross_loss = abs(sum(min(0.0, float(row["realized_pnl_usdc"] or 0)) for row in maker_pnls))
+    maker_attempts = int(maker_orders["attempts"] or 0)
+    maker_filled = int(maker_orders["filled_orders"] or 0)
+    maker_fills_24h = conn.execute(
+        "SELECT COUNT(DISTINCT order_id) FROM fills WHERE created_at >= ? AND json_extract(metadata_json, '$.execution_style') = 'maker'"
+        + (" AND policy_version = ?" if policy_version else ""),
+        (cutoff, policy_version) if policy_version else (cutoff,),
+    ).fetchone()[0]
     gate_counts: dict[str, int] = {}
     gate_telemetry_decisions = 0
     metadata_rows = conn.execute(
@@ -1021,7 +1061,7 @@ def _execution_stats(conn: sqlite3.Connection) -> dict:
         book_sources[source] = book_sources.get(source, 0) + 1
     return {
         "window": "24h",
-        "target_entries_per_day": {"min": 2, "max": 6},
+        "target_entries_per_day": {"min": 0, "max": 2} if maker_active else {"min": 2, "max": 6},
         "decisions": int(decisions or 0),
         "signal_candidates": int(candidates or 0),
         "risk_approved": int(approved or 0),
@@ -1043,6 +1083,16 @@ def _execution_stats(conn: sqlite3.Connection) -> dict:
             "books": {"sources": book_sources, "fresh": all(bool(item.get("book_fresh")) for item in markets_state if item.get("status") == "ok")},
         },
         "stale_risk_warning": stale_risk,
+        "maker": {
+            "policy_version": policy_version,
+            "open_orders": int(maker_orders["open_orders"] or 0),
+            "canceled_orders": int(maker_orders["canceled_orders"] or 0),
+            "filled_orders": maker_filled,
+            "fill_rate": maker_filled / maker_attempts if maker_attempts else None,
+            "fills_last_24h": int(maker_fills_24h or 0),
+            "settled_pnl_usdc": sum(float(row["realized_pnl_usdc"] or 0) for row in maker_pnls),
+            "profit_factor": maker_gross_profit / maker_gross_loss if maker_gross_loss else None,
+        },
     }
 
 

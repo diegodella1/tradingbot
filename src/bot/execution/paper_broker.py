@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 from bot.config import Settings
@@ -20,6 +21,19 @@ class PaperBroker:
 
     def place_limit_order(self, request: OrderRequest, book: OrderBook) -> OrderRecord:
         order_id = f"paper-{uuid4()}"
+        if self.settings.paper_order_style == "maker" and request.side == OrderSide.BUY:
+            now = datetime.now(UTC)
+            record = OrderRecord(
+                order_id=order_id,
+                request=request,
+                status=OrderStatus.OPEN,
+                execution_style="maker",
+                expires_at=now + timedelta(seconds=self.settings.paper_maker_fill_window_seconds),
+                created_at=now,
+                updated_at=now,
+            )
+            self.orders[order_id] = record
+            return record
         executable_price = book.best_ask if request.side == OrderSide.BUY else book.best_bid
         if executable_price is None:
             record = OrderRecord(order_id=order_id, request=request, status=OrderStatus.REJECTED)
@@ -54,6 +68,55 @@ class PaperBroker:
             )
         )
         return record
+
+    def hydrate_orders(self, orders: list[OrderRecord]) -> None:
+        for order in orders:
+            self.orders[order.order_id] = order
+
+    def reconcile_maker_order(
+        self,
+        order: OrderRecord,
+        book: OrderBook | None,
+        now: datetime | None = None,
+    ) -> tuple[OrderRecord, FillRecord | None]:
+        """Fill a resting paper bid only after a later ask trades through it."""
+        now = now or datetime.now(UTC)
+        if order.status not in {OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED}:
+            return order, None
+        if order.execution_style != "maker":
+            return order, None
+        if order.expires_at is not None and now >= order.expires_at:
+            order.status = OrderStatus.CANCELED
+            order.request.reason = "maker fill window expired"
+            order.updated_at = now
+            self.orders[order.order_id] = order
+            return order, None
+        if book is None or book.best_ask is None or book.best_ask > order.request.price:
+            return order, None
+
+        remaining = max(0.0, order.request.size_usdc - order.filled_size_usdc)
+        top_liquidity = book.asks[0].notional if book.asks else 0.0
+        filled = min(remaining, max(0.0, top_liquidity * self.settings.paper_fill_ratio))
+        if filled <= 0:
+            return order, None
+        order.filled_size_usdc += filled
+        order.avg_fill_price = order.request.price
+        order.status = OrderStatus.FILLED if order.filled_size_usdc >= order.request.size_usdc else OrderStatus.PARTIALLY_FILLED
+        order.updated_at = now
+        fill = FillRecord(
+            order_id=order.order_id,
+            market_id=order.request.market_id,
+            token_id=order.request.token_id,
+            side=order.request.side,
+            price=order.request.price,
+            size_usdc=filled,
+            fee_usdc=0.0,
+            metadata={**order.request.metadata, "execution_style": "maker", "maker_rebate_usdc": 0.0},
+            created_at=now,
+        )
+        self.fills.append(fill)
+        self.orders[order.order_id] = order
+        return order, fill
 
     def place_sell_order(self, request: OrderRequest, book: OrderBook, shares: float) -> tuple[OrderRecord, float, float]:
         """Simulate closing a position by selling `shares` at the bid.
@@ -98,4 +161,5 @@ class PaperBroker:
         if record and record.status in {OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED}:
             record.status = OrderStatus.CANCELED
             record.request.reason = reason or record.request.reason
+            record.updated_at = datetime.now(UTC)
         return record

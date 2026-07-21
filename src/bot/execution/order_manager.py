@@ -20,14 +20,29 @@ class OrderManager:
         if book is None:
             return None, decision
 
+        price = signal.max_price
+        if self.paper_broker.settings.paper_order_style == "maker":
+            price = book.best_bid
+            if price is None:
+                return None, decision
+
         request = OrderRequest(
             market_id=context.market.market_id,
             token_id=context.market.tokens[token_side].token_id,
             side=OrderSide.BUY,
-            price=signal.max_price,
-            size_usdc=max(1e-6, signal.size_usdc * decision.size_multiplier),
+            price=price,
+            size_usdc=max(
+                1e-6,
+                min(signal.size_usdc * decision.size_multiplier, self.paper_broker.settings.paper_max_trade_size_usdc),
+            ),
             reason=signal.reason,
-            metadata={**(signal.metadata or {}), "risk_decision": decision.reason, "risk_size_multiplier": decision.size_multiplier},
+            metadata={
+                **(signal.metadata or {}),
+                "risk_decision": decision.reason,
+                "risk_size_multiplier": decision.size_multiplier,
+                "execution_style": self.paper_broker.settings.paper_order_style,
+                "signal_max_price": signal.max_price,
+            },
         )
         order = self.paper_broker.place_limit_order(request, book)
         if order.filled_size_usdc > 0:

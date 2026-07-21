@@ -5,7 +5,7 @@ import sqlite3
 from datetime import UTC, datetime, timedelta
 
 from bot.execution.risk_manager import RiskDecision, RiskState
-from bot.polymarket.models import FillRecord, OrderBook, OrderRecord, Signal, UpDownMarket
+from bot.polymarket.models import FillRecord, OrderBook, OrderRecord, OrderRequest, OrderSide, OrderStatus, Signal, UpDownMarket
 
 
 def now_text() -> str:
@@ -194,16 +194,17 @@ class Repository:
         )
         self.conn.commit()
 
-    def save_order(self, order: OrderRecord) -> None:
+    def save_order(self, order: OrderRecord, *, commit: bool = True) -> None:
         metadata = order.request.metadata or {}
         self.conn.execute(
             """
             INSERT OR REPLACE INTO orders (
               order_id, market_id, token_id, side, status, price, size_usdc,
               filled_size_usdc, avg_fill_price, reason, policy_version,
-              metadata_json, config_snapshot_json, created_at
+              metadata_json, config_snapshot_json, execution_style, expires_at,
+              updated_at, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 order.order_id,
@@ -219,12 +220,63 @@ class Repository:
                 metadata.get("policy_version"),
                 json.dumps(metadata),
                 json.dumps(metadata.get("config_snapshot")) if metadata.get("config_snapshot") is not None else None,
+                order.execution_style,
+                order.expires_at.isoformat() if order.expires_at else None,
+                order.updated_at.isoformat(),
                 order.created_at.isoformat(),
             ),
         )
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
 
-    def save_fill(self, fill: FillRecord) -> None:
+    def open_maker_orders(self) -> list[OrderRecord]:
+        rows = self.conn.execute(
+            """
+            SELECT * FROM orders
+            WHERE execution_style = 'maker' AND status IN ('OPEN', 'PARTIALLY_FILLED')
+            ORDER BY created_at
+            """
+        ).fetchall()
+        orders: list[OrderRecord] = []
+        for row in rows:
+            metadata = json.loads(row["metadata_json"] or "{}")
+            orders.append(
+                OrderRecord(
+                    order_id=row["order_id"],
+                    request=OrderRequest(
+                        market_id=row["market_id"],
+                        token_id=row["token_id"],
+                        side=OrderSide(row["side"]),
+                        price=float(row["price"]),
+                        size_usdc=float(row["size_usdc"]),
+                        reason=row["reason"] or "",
+                        metadata=metadata,
+                    ),
+                    status=OrderStatus(row["status"]),
+                    filled_size_usdc=float(row["filled_size_usdc"] or 0),
+                    avg_fill_price=float(row["avg_fill_price"]) if row["avg_fill_price"] is not None else None,
+                    execution_style="maker",
+                    expires_at=_parse_utc(row["expires_at"]),
+                    created_at=_parse_utc(row["created_at"]) or datetime.now(UTC),
+                    updated_at=_parse_utc(row["updated_at"]) or _parse_utc(row["created_at"]) or datetime.now(UTC),
+                )
+            )
+        return orders
+
+    def cancel_open_maker_orders(self, reason: str) -> int:
+        now = now_text()
+        result = self.conn.execute(
+            """
+            UPDATE orders
+            SET status = 'CANCELED', reason = ?, updated_at = ?
+            WHERE execution_style = 'maker' AND status IN ('OPEN', 'PARTIALLY_FILLED')
+            """,
+            (reason, now),
+        )
+        self.conn.commit()
+        return int(result.rowcount)
+
+    def save_fill(self, fill: FillRecord, *, commit: bool = True) -> None:
         metadata = fill.metadata or {}
         self.conn.execute(
             """
@@ -249,10 +301,15 @@ class Repository:
                 fill.created_at.isoformat(),
             ),
         )
-        self.conn.commit()
-        self.upsert_position(fill)
+        self.upsert_position(fill, commit=commit)
 
-    def upsert_position(self, fill: FillRecord) -> None:
+    def save_order_and_fill(self, order: OrderRecord, fill: FillRecord) -> None:
+        """Persist lifecycle transition, fill and position as one transaction."""
+        with self.conn:
+            self.save_order(order, commit=False)
+            self.save_fill(fill, commit=False)
+
+    def upsert_position(self, fill: FillRecord, *, commit: bool = True) -> None:
         metadata = fill.metadata or {}
         shares = fill.size_usdc / fill.price if fill.price > 0 else 0.0
         existing = self.conn.execute(
@@ -319,7 +376,8 @@ class Repository:
                     now_text(),
                 ),
             )
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
 
     def hydrate_risk_state(self, loss_streak_window_minutes: int = 120) -> RiskState:
         state = RiskState()
@@ -351,6 +409,23 @@ class Repository:
             state.market_exposure[row["market_id"]] = state.market_exposure.get(row["market_id"], 0.0) + exposure
             state.token_exposure[row["token_id"]] = state.token_exposure.get(row["token_id"], 0.0) + exposure
             state.trades_by_market[row["market_id"]] = state.trades_by_market.get(row["market_id"], 0) + 1
+        pending = self.conn.execute(
+            """
+            SELECT market_id, token_id, SUM(size_usdc - COALESCE(filled_size_usdc, 0)) AS exposure
+            FROM orders
+            WHERE execution_style = 'maker'
+              AND status IN ('OPEN', 'PARTIALLY_FILLED')
+              AND (expires_at IS NULL OR expires_at > ?)
+            GROUP BY market_id, token_id
+            """,
+            (now_text(),),
+        ).fetchall()
+        for row in pending:
+            exposure = max(0.0, float(row["exposure"] or 0))
+            if exposure <= 0:
+                continue
+            state.market_exposure[row["market_id"]] = state.market_exposure.get(row["market_id"], 0.0) + exposure
+            state.token_exposure[row["token_id"]] = state.token_exposure.get(row["token_id"], 0.0) + exposure
         self._apply_frequency_risk_state(state)
         self._apply_pnl_risk_state(state, loss_streak_window_minutes)
         return state
@@ -358,11 +433,9 @@ class Repository:
     def _apply_frequency_risk_state(self, state: RiskState) -> None:
         now = datetime.now(UTC)
         hour_ago = (now - timedelta(hours=1)).isoformat()
-        row = self.conn.execute("SELECT COUNT(*) FROM orders WHERE created_at >= ?", (hour_ago,)).fetchone()
-        state.trades_last_hour = int(row[0] or 0)
         day_start = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-        row = self.conn.execute("SELECT COUNT(*) FROM orders WHERE created_at >= ?", (day_start,)).fetchone()
-        state.trades_today = int(row[0] or 0)
+        state.trades_last_hour = self._filled_trade_count_since(hour_ago)
+        state.trades_today = self._filled_trade_count_since(day_start)
 
         recent_5m = self.conn.execute(
             """
@@ -394,6 +467,22 @@ class Repository:
         state.recent_pnl_usdc = sum(float(row["realized_pnl_usdc"] or 0) for row in recent)
         state.last_settled_at = _parse_utc(recent[0]["settled_at"]) if recent else None
 
+    def _filled_trade_count_since(self, cutoff: str) -> int:
+        row = self.conn.execute(
+            """
+            SELECT
+              (SELECT COUNT(*) FROM orders
+               WHERE COALESCE(execution_style, 'taker') != 'maker'
+                 AND status IN ('FILLED', 'PARTIALLY_FILLED') AND created_at >= ?)
+              +
+              (SELECT COUNT(DISTINCT f.order_id) FROM fills f
+               JOIN orders o ON o.order_id = f.order_id
+               WHERE o.execution_style = 'maker' AND f.side = 'BUY' AND f.created_at >= ?)
+            """,
+            (cutoff, cutoff),
+        ).fetchone()
+        return int(row[0] or 0)
+
     def _apply_pnl_risk_state(self, state: RiskState, loss_streak_window_minutes: int = 120) -> None:
         """Populate loss-tracking fields so daily-loss/streak/cooldown gates work at runtime.
 
@@ -413,6 +502,16 @@ class Repository:
             (day_start,),
         ).fetchone()
         state.daily_pnl_usdc = float(daily[0] or 0)
+        losses = self.conn.execute(
+            """
+            SELECT COUNT(*) FROM positions
+            WHERE status IN ('WON', 'LOST', 'CLOSED')
+              AND settled_at IS NOT NULL AND settled_at >= ?
+              AND realized_pnl_usdc < 0
+            """,
+            (day_start,),
+        ).fetchone()
+        state.losses_today = int(losses[0] or 0)
 
         window_start = (datetime.now(UTC) - timedelta(minutes=loss_streak_window_minutes)).isoformat()
         recent = self.conn.execute(

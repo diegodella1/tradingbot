@@ -15,7 +15,11 @@ probability_model.json
 probability_model.candidate.json
 probability_model.rejected.json
 logs/
-artifacts/
+artifacts/*
+!artifacts/policy-evidence/
+artifacts/policy-evidence/*
+!artifacts/policy-evidence/btc-updown-v4-maker-experiment.json
+!artifacts/policy-evidence/btc-updown-v4-maker-experiment.config.json
 frontend/downloads/
 
 .agents/

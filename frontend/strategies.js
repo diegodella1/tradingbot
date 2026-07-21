@@ -158,6 +158,9 @@ function renderEngineParams(config) {
     ["Min Kelly Size", fmtUsd(config.min_kelly_size_usdc)],
     ["Token Max Exposure", fmtUsd(config.max_token_position_usdc)],
     ["Trade Size", fmtUsd(config.paper_trade_size_usdc)],
+    ["Paper Order Style", config.paper_order_style || "taker"],
+    ["Maker Fill Window", `${config.paper_maker_fill_window_seconds || 0}s`],
+    ["Paper Max Trade", fmtUsd(config.paper_max_trade_size_usdc)],
     ["Max Position", fmtUsd(config.max_position_usdc)],
     ["Daily Loss Stop", fmtUsd(config.max_daily_loss_usdc)],
     ["Max Open Markets", config.max_open_markets],
@@ -213,7 +216,8 @@ function renderExecution(execution) {
   const stats = execution || {};
   const target = stats.target_entries_per_day || {};
   const btc = stats.feed_health?.btc || {};
-  $("#executionSummary").textContent = `${stats.window || "24h"} · last entry ${fmtAge(stats.hours_since_latest_fill)} · target ${target.min || 2}–${target.max || 6}/day · BTC ${btc.source || "unknown"} ${fmtNum(btc.age_seconds, 1)}s · open ${fmtUsd(stats.open_exposure_usdc || 0)}`;
+  const maker = stats.maker || {};
+  $("#executionSummary").textContent = `${stats.window || "24h"} · last entry ${fmtAge(stats.hours_since_latest_fill)} · target ${target.min ?? 2}–${target.max ?? 6}/day · BTC ${btc.source || "unknown"} ${fmtNum(btc.age_seconds, 1)}s · open ${fmtUsd(stats.open_exposure_usdc || 0)}`;
   const warnings = [];
   if (stats.stale_risk_warning) warnings.push("stale risk suspected");
   if (!btc.fresh) warnings.push("BTC feed stale");
@@ -224,6 +228,16 @@ function renderExecution(execution) {
     ["Risk Approved", stats.risk_approved || 0],
     ["Paper Fills", stats.paper_fills || 0],
   ];
+  if (maker.policy_version) {
+    items.push(
+      ["Maker Open", maker.open_orders || 0],
+      ["Maker Canceled", maker.canceled_orders || 0],
+      ["Maker Fill Rate", fmtPct(maker.fill_rate)],
+      ["Maker Fills / Day", maker.fills_last_24h || 0],
+      ["Maker PnL", fmtUsd(maker.settled_pnl_usdc || 0)],
+      ["Maker PF", fmtNum(maker.profit_factor, 2)],
+    );
+  }
   $("#executionFunnel").innerHTML = items.map(([label, value]) => `
     <div class="bg-surface-container-low p-4 rounded-lg border border-outline-variant/30">
       <div class="text-xs uppercase tracking-wide text-outline">${label}</div>

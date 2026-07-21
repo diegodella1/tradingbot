@@ -3,7 +3,12 @@ from __future__ import annotations
 import sqlite3
 
 
-def regime_snapshot(conn: sqlite3.Connection, window_trades: int = 50, min_trades: int = 30) -> dict:
+def regime_snapshot(
+    conn: sqlite3.Connection,
+    window_trades: int = 50,
+    min_trades: int = 30,
+    policy_version: str | None = None,
+) -> dict:
     """Rolling win rate vs the real breakeven of the trades actually taken.
 
     For a binary position bought at price p with fee f per staked dollar, the
@@ -12,15 +17,18 @@ def regime_snapshot(conn: sqlite3.Connection, window_trades: int = 50, min_trade
     trades drops below the average breakeven, the edge is gone (e.g. momentum
     dying in a mean-reversion regime) and the caller should alert/stop.
     """
+    policy_clause = " AND policy_version = ?" if policy_version else ""
+    parameters = (policy_version, window_trades) if policy_version else (window_trades,)
     rows = conn.execute(
-        """
+        f"""
         SELECT status, avg_price, size_usdc, fee_usdc, realized_pnl_usdc
         FROM positions
         WHERE status IN ('WON', 'LOST', 'CLOSED') AND settled_at IS NOT NULL
+        {policy_clause}
         ORDER BY settled_at DESC
         LIMIT ?
         """,
-        (window_trades,),
+        parameters,
     ).fetchall()
     trades = len(rows)
     if trades == 0:

@@ -69,6 +69,9 @@ CREATE TABLE IF NOT EXISTS orders (
   policy_version TEXT,
   metadata_json TEXT,
   config_snapshot_json TEXT,
+  execution_style TEXT NOT NULL DEFAULT 'taker',
+  expires_at TEXT,
+  updated_at TEXT,
   created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS fills (
@@ -327,6 +330,7 @@ def init_db(path: Path) -> None:
         _ensure_column(conn, "positions", "status", "TEXT DEFAULT 'OPEN'")
         _ensure_column(conn, "positions", "realized_pnl_usdc", "REAL DEFAULT 0")
         _ensure_policy_columns(conn)
+        _ensure_order_lifecycle_columns(conn)
         _run_migrations(conn)
         _ensure_column(conn, "positions", "settlement_outcome", "TEXT")
         _ensure_column(conn, "positions", "settled_at", "TEXT")
@@ -396,6 +400,7 @@ def force_settle_pending_positions(path: Path) -> dict[str, int]:
         _ensure_column(conn, "positions", "status", "TEXT DEFAULT 'OPEN'")
         _ensure_column(conn, "positions", "realized_pnl_usdc", "REAL DEFAULT 0")
         _ensure_policy_columns(conn)
+        _ensure_order_lifecycle_columns(conn)
         _run_migrations(conn)
         _ensure_column(conn, "positions", "settlement_outcome", "TEXT")
         _ensure_column(conn, "positions", "settled_at", "TEXT")
@@ -470,6 +475,16 @@ def _ensure_policy_columns(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "policy_versions", "config_sha256", "TEXT")
     _ensure_column(conn, "policy_versions", "evidence_sha256", "TEXT")
     _ensure_column(conn, "policy_versions", "model_sha256", "TEXT")
+
+
+def _ensure_order_lifecycle_columns(conn: sqlite3.Connection) -> None:
+    _ensure_column(conn, "orders", "execution_style", "TEXT NOT NULL DEFAULT 'taker'")
+    _ensure_column(conn, "orders", "expires_at", "TEXT")
+    _ensure_column(conn, "orders", "updated_at", "TEXT")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_orders_open_execution_expiry "
+        "ON orders(status, execution_style, expires_at)"
+    )
 
 
 def _backfill_open_positions(conn: sqlite3.Connection) -> None:

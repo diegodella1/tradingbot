@@ -53,6 +53,9 @@ class Settings(BaseSettings):
     paper_fill_ratio: float = 0.75
     paper_enable_fees: bool = True
     paper_taker_fee_rate: float = 0.07
+    paper_order_style: Literal["taker", "maker"] = "taker"
+    paper_maker_fill_window_seconds: int = 60
+    paper_max_trade_size_usdc: float = 5.0
     paper_loop_interval_seconds: float = 10.0
     paper_bankroll_usdc: float = 10.0
     paper_trade_size_usdc: float = 1.0
@@ -67,6 +70,12 @@ class Settings(BaseSettings):
     regime_window_trades: int = 50
     regime_min_trades: int = 30
     enable_regime_stop: bool = False
+    paper_experiment_enabled: bool = False
+    paper_experiment_stop_loss_usdc: float = 1.0
+    paper_experiment_max_drawdown_pct: float = 0.01
+    paper_experiment_min_fills: int = 20
+    paper_experiment_min_profit_factor: float = 1.10
+    paper_experiment_min_fill_rate: float = 0.50
     live_order_style: Literal["taker", "maker"] = "taker"
     min_edge_cents: float = 3.0
     min_confidence: float = 0.70
@@ -263,6 +272,15 @@ class Settings(BaseSettings):
             "paper_trade_size_usdc",
             "paper_enable_fees",
             "paper_taker_fee_rate",
+            "paper_order_style",
+            "paper_maker_fill_window_seconds",
+            "paper_max_trade_size_usdc",
+            "paper_experiment_enabled",
+            "paper_experiment_stop_loss_usdc",
+            "paper_experiment_max_drawdown_pct",
+            "paper_experiment_min_fills",
+            "paper_experiment_min_profit_factor",
+            "paper_experiment_min_fill_rate",
             "kelly_fraction_multiplier",
             "hold_to_resolution",
         )

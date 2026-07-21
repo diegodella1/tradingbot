@@ -1,0 +1,20 @@
+{
+  "analysis_type": "expanding_daily_walk_forward_with_conservative_maker_fill_proxy",
+  "assumptions": {
+    "fill_rule": "a later best ask is less than or equal to the posted best bid",
+    "fill_window_seconds": 60,
+    "maker_fee_usdc": 0.0,
+    "maker_rebate_usdc": 0.0,
+    "stake_usdc": 1.0
+  },
+  "data_end": "2026-07-21",
+  "data_start": "2026-07-14",
+  "maker_fill_rate": 0.8,
+  "pnl_usdc": 2.797,
+  "profitable_windows": 4,
+  "roi": 0.349625,
+  "signals": 10,
+  "trades": 8,
+  "windows": 5,
+  "wins": 7
+}

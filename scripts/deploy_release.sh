@@ -4,6 +4,8 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEPLOY_ROOT="${DEPLOY_ROOT:-/home/diego/.local/share/tradingbot}"
 REQUIRE_PUBLISHED="${REQUIRE_PUBLISHED:-true}"
+ACTIVATE_MAKER_EXPERIMENT="${ACTIVATE_MAKER_EXPERIMENT:-false}"
+MAKER_EXPERIMENT_VERSION="${MAKER_EXPERIMENT_VERSION:-btc-updown-v4-maker-experiment}"
 SHA="${1:-$(git -C "$ROOT_DIR" rev-parse HEAD)}"
 SHA="$(git -C "$ROOT_DIR" rev-parse "$SHA^{commit}")"
 RELEASE_DIR="$DEPLOY_ROOT/releases/$SHA"
@@ -33,6 +35,7 @@ fi
 printf 'DEPLOY_COMMIT=%s\n' "$SHA" > "$RELEASE_DIR/deploy.env"
 
 PREVIOUS_RELEASE=""
+EXPERIMENT_ACTIVATED="false"
 if [ -L "$CURRENT_LINK" ]; then
   PREVIOUS_RELEASE="$(readlink -f "$CURRENT_LINK" 2>/dev/null || true)"
 fi
@@ -40,6 +43,10 @@ ln -sfn "$RELEASE_DIR" "$NEXT_LINK"
 mv -Tf "$NEXT_LINK" "$CURRENT_LINK"
 
 rollback() {
+  if [ "$EXPERIMENT_ACTIVATED" = "true" ]; then
+    PYTHONPATH="$RELEASE_DIR/src" "$ROOT_DIR/.venv/bin/python" -m bot.cli \
+      policy-experiment-rollback --version "$MAKER_EXPERIMENT_VERSION" || true
+  fi
   if [ -n "$PREVIOUS_RELEASE" ] && [ -d "$PREVIOUS_RELEASE" ]; then
     ln -sfn "$PREVIOUS_RELEASE" "$NEXT_LINK"
     mv -Tf "$NEXT_LINK" "$CURRENT_LINK"
@@ -48,6 +55,12 @@ rollback() {
   fi
 }
 trap rollback ERR
+
+if [ "$ACTIVATE_MAKER_EXPERIMENT" = "true" ]; then
+  EXPERIMENT_ACTIVATED="true"
+  PYTHONPATH="$RELEASE_DIR/src" "$ROOT_DIR/.venv/bin/python" \
+    "$RELEASE_DIR/scripts/activate_maker_experiment.py"
+fi
 
 sudo systemctl restart tradingbot-paper.service tradingbot-frontend.service
 

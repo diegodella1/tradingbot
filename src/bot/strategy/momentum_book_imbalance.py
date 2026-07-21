@@ -137,7 +137,7 @@ class MomentumBookImbalanceStrategy(Strategy):
         shares = 1 / ask if ask > 0 else 0.0
         fee = (
             polymarket_taker_fee_usdc(shares, ask, self.settings.paper_taker_fee_rate)
-            if shares > 0 and self.settings.paper_enable_fees
+            if shares > 0 and self.settings.paper_enable_fees and self.settings.paper_order_style == "taker"
             else 0.0
         )
         break_even = (1 + fee) / shares if shares > 0 else 1.0
@@ -152,6 +152,7 @@ class MomentumBookImbalanceStrategy(Strategy):
         max_trade_size = min(
             self.settings.max_position_usdc,
             self.settings.max_market_position_usdc,
+            self.settings.paper_max_trade_size_usdc,
             self.settings.paper_bankroll_usdc * self.settings.max_trade_pct_for(market_type),
         )
         recommended_size = min(
@@ -220,7 +221,7 @@ class MomentumBookImbalanceStrategy(Strategy):
         profit_if_win_per_1 = shares_per_1 - 1
         estimated_fee_per_1 = (
             polymarket_taker_fee_usdc(shares_per_1, ask, self.settings.paper_taker_fee_rate)
-            if self.settings.paper_enable_fees
+            if self.settings.paper_enable_fees and self.settings.paper_order_style == "taker"
             else 0.0
         )
         break_even_probability_after_fees = (1 + estimated_fee_per_1) / shares_per_1 if shares_per_1 > 0 else 1.0
@@ -231,6 +232,7 @@ class MomentumBookImbalanceStrategy(Strategy):
         max_trade_size = min(
             self.settings.max_position_usdc,
             self.settings.max_market_position_usdc,
+            self.settings.paper_max_trade_size_usdc,
             self.settings.paper_bankroll_usdc * self.settings.max_trade_pct_for(market_type),
         )
         tier_size = self.settings.size_tier_usdc(estimated_probability, net_edge_cents)

@@ -5,11 +5,13 @@ import json
 import pytest
 
 from bot.learning.versions import (
+    activate_paper_experiment,
     active_policy,
     activate_candidate,
     apply_active_policy,
     evaluate_and_transition,
     evaluate_policy,
+    ensure_baseline_policy,
     policy_metrics,
     register_candidate,
 )
@@ -194,3 +196,51 @@ def test_activating_candidate_supersedes_any_validated_active_policy(settings):
 
     assert [(row["version"], row["is_active"]) for row in rows] == [("v-one", 0), ("v-two", 1)]
     assert rows[0]["status"] == "validated"
+
+
+def test_maker_experiment_hard_stop_restores_previous_policy_and_cancels_orders(settings):
+    settings = settings.model_copy(update={"paper_bankroll_usdc": 10.0})
+    init_db(settings.sqlite_path)
+    with connect(settings.sqlite_path) as conn:
+        previous = ensure_baseline_policy(conn, settings)
+        register_candidate(
+            conn,
+            "v4-maker",
+            {
+                "paper_order_style": "maker",
+                "paper_experiment_enabled": True,
+                "paper_max_trade_size_usdc": 0.25,
+            },
+            {"trades": 8, "pnl_usdc": 2.0, "roi": 0.25, "windows": 5, "profitable_windows": 4},
+            evidence_sha256="c" * 64,
+        )
+        activated = activate_paper_experiment(conn, "v4-maker", settings)
+        now = "2026-07-21T12:00:00+00:00"
+        conn.execute(
+            """
+            INSERT INTO positions (
+              market_id, token_id, size_usdc, avg_price, status, realized_pnl_usdc,
+              policy_version, break_even_probability, settled_at, updated_at
+            ) VALUES ('loss', 'token', 0.25, 0.60, 'LOST', -0.25, 'v4-maker', 0.60, ?, ?)
+            """,
+            (now, now),
+        )
+        conn.execute(
+            """
+            INSERT INTO orders (
+              order_id, market_id, token_id, side, status, price, size_usdc,
+              execution_style, policy_version, created_at
+            ) VALUES ('pending', 'next', 'token', 'BUY', 'OPEN', 0.59, 0.25, 'maker', 'v4-maker', ?)
+            """,
+            (now,),
+        )
+        conn.commit()
+
+        decision = evaluate_and_transition(conn, "v4-maker", settings)
+        active = active_policy(conn)
+        pending = conn.execute("SELECT status FROM orders WHERE order_id='pending'").fetchone()
+
+    assert activated.status == "paper_active"
+    assert decision.status == "stopped"
+    assert active["version"] == previous["version"]
+    assert pending["status"] == "CANCELED"
