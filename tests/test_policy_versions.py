@@ -13,7 +13,9 @@ from bot.learning.versions import (
     evaluate_policy,
     ensure_baseline_policy,
     policy_metrics,
+    predecessor_experiment_ready,
     register_candidate,
+    rollback_paper_experiment,
 )
 from bot.storage.db import connect, init_db
 
@@ -62,6 +64,18 @@ def test_candidate_rejects_live_or_unknown_config(settings):
     with connect(settings.sqlite_path) as conn:
         with pytest.raises(ValueError, match="unsupported paper policy keys"):
             register_candidate(conn, "unsafe", {"enable_live_trading": True}, {"trades": 20, "pnl_usdc": 1, "roi": 0.1, "windows": 1, "profitable_windows": 1})
+
+
+def test_candidate_rejects_negative_maker_bid_offset(settings):
+    init_db(settings.sqlite_path)
+    with connect(settings.sqlite_path) as conn:
+        with pytest.raises(ValueError, match="paper_maker_bid_offset_cents"):
+            register_candidate(
+                conn,
+                "unsafe-offset",
+                {"paper_order_style": "maker", "paper_maker_bid_offset_cents": -1},
+                {"trades": 20, "pnl_usdc": 1, "roi": 0.1, "windows": 1, "profitable_windows": 1},
+            )
 
 
 def test_policy_version_is_immutable(settings):
@@ -244,3 +258,81 @@ def test_maker_experiment_hard_stop_restores_previous_policy_and_cancels_orders(
     assert decision.status == "stopped"
     assert active["version"] == previous["version"]
     assert pending["status"] == "CANCELED"
+
+
+def test_maker_experiment_applies_bid_offset_and_margin_gates(settings):
+    init_db(settings.sqlite_path)
+    with connect(settings.sqlite_path) as conn:
+        register_candidate(
+            conn,
+            "v5-margin",
+            {
+                "paper_order_style": "maker",
+                "paper_maker_bid_offset_cents": 1.0,
+                "paper_experiment_enabled": True,
+                "paper_experiment_min_profit_factor": 1.25,
+                "paper_experiment_min_fill_rate": 0.60,
+                "min_edge_cents": 2.5,
+                "min_net_edge_cents": 2.5,
+                "min_net_edge_15m_cents": 2.5,
+            },
+            {"trades": 10, "pnl_usdc": 0.64, "roi": 0.25, "windows": 6, "profitable_windows": 4},
+            evidence_sha256="e" * 64,
+        )
+        activate_paper_experiment(conn, "v5-margin", settings)
+        effective = apply_active_policy(settings, conn)
+
+    assert effective.paper_maker_bid_offset_cents == 1.0
+    assert effective.paper_experiment_min_profit_factor == 1.25
+    assert effective.paper_experiment_min_fill_rate == 0.60
+    assert effective.minimum_net_edge_cents_for("15m") == 2.5
+
+
+def test_rollback_of_inactive_candidate_does_not_restore_stale_predecessor(settings):
+    init_db(settings.sqlite_path)
+    with connect(settings.sqlite_path) as conn:
+        baseline = ensure_baseline_policy(conn, settings)
+        _candidate(conn, "inactive")
+
+        restored = rollback_paper_experiment(conn, "inactive")
+        candidate = conn.execute("SELECT status FROM policy_versions WHERE version='inactive'").fetchone()
+
+    assert restored == baseline["version"]
+    assert candidate["status"] == "candidate"
+
+
+def test_successor_waits_until_predecessor_has_twenty_fills_or_stops(settings):
+    init_db(settings.sqlite_path)
+    with connect(settings.sqlite_path) as conn:
+        register_candidate(
+            conn,
+            "v4-maker",
+            {"paper_order_style": "maker", "paper_experiment_enabled": True},
+            {"trades": 8, "pnl_usdc": 1, "roi": 0.1, "windows": 2, "profitable_windows": 2},
+            evidence_sha256="d" * 64,
+        )
+        activate_paper_experiment(conn, "v4-maker", settings)
+        _settled(conn, "v4-maker", 19, 14, win_pnl=0.15, loss_pnl=-0.25)
+
+        ready, reason = predecessor_experiment_ready(conn, "v4-maker")
+        conn.execute(
+            """
+            INSERT INTO positions (
+              market_id, token_id, size_usdc, avg_price, status,
+              realized_pnl_usdc, policy_version, settled_at, updated_at
+            ) VALUES ('maturity-fill', 'token', 0.25, 0.65, 'WON', 0.13, 'v4-maker', ?, ?)
+            """,
+            ("2026-01-02T00:00:00+00:00", "2026-01-02T00:00:00+00:00"),
+        )
+        conn.commit()
+        mature_ready, mature_reason = predecessor_experiment_ready(conn, "v4-maker")
+        conn.execute("UPDATE policy_versions SET status='stopped', is_active=0 WHERE version='v4-maker'")
+        conn.commit()
+        stopped_ready, stopped_reason = predecessor_experiment_ready(conn, "v4-maker")
+
+    assert ready is False
+    assert "19/20" in reason
+    assert mature_ready is True
+    assert "20/20" in mature_reason
+    assert stopped_ready is True
+    assert "stopped" in stopped_reason

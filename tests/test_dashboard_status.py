@@ -475,3 +475,4 @@ def test_dashboard_get_payloads_are_read_only(settings, monkeypatch):
     assert analytics_payload()["kpis"]["decision_count"] == 0
     assert strategies_payload()["mode"] == "paper"
     assert "summary" in learning_payload()
+    assert web.evolution_payload()["mode"] == "paper"

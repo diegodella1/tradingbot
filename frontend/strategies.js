@@ -160,6 +160,7 @@ function renderEngineParams(config) {
     ["Trade Size", fmtUsd(config.paper_trade_size_usdc)],
     ["Paper Order Style", config.paper_order_style || "taker"],
     ["Maker Fill Window", `${config.paper_maker_fill_window_seconds || 0}s`],
+    ["Maker Bid Offset", `${config.paper_maker_bid_offset_cents || 0}¢`],
     ["Paper Max Trade", fmtUsd(config.paper_max_trade_size_usdc)],
     ["Max Position", fmtUsd(config.max_position_usdc)],
     ["Daily Loss Stop", fmtUsd(config.max_daily_loss_usdc)],

@@ -57,9 +57,21 @@ rollback() {
 trap rollback ERR
 
 if [ "$ACTIVATE_MAKER_EXPERIMENT" = "true" ]; then
-  EXPERIMENT_ACTIVATED="true"
+  case "$MAKER_EXPERIMENT_VERSION" in
+    btc-updown-v4-maker-experiment)
+      MAKER_ACTIVATION_SCRIPT="$RELEASE_DIR/scripts/activate_maker_experiment.py"
+      ;;
+    btc-updown-v5-margin-maker)
+      MAKER_ACTIVATION_SCRIPT="$RELEASE_DIR/scripts/activate_margin_maker_experiment.py"
+      ;;
+    *)
+      echo "ERROR unsupported_maker_experiment=$MAKER_EXPERIMENT_VERSION"
+      false
+      ;;
+  esac
   PYTHONPATH="$RELEASE_DIR/src" "$ROOT_DIR/.venv/bin/python" \
-    "$RELEASE_DIR/scripts/activate_maker_experiment.py"
+    "$MAKER_ACTIVATION_SCRIPT"
+  EXPERIMENT_ACTIVATED="true"
 fi
 
 sudo systemctl restart tradingbot-paper.service tradingbot-frontend.service

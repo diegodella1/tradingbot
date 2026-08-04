@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+from bot.execution.order_manager import OrderManager, paper_maker_bid_price
 from bot.execution.paper_broker import PaperBroker
-from bot.polymarket.models import BookLevel, OrderBook, OrderRequest, OrderSide, OrderStatus
+from bot.execution.risk_manager import RiskManager
+from bot.polymarket.models import BookLevel, OrderBook, OrderRequest, OrderSide, OrderStatus, Signal, SignalAction
 from bot.storage.db import connect, init_db
 from bot.storage.repositories import Repository
 
@@ -49,6 +51,32 @@ def test_maker_order_cancels_after_fill_window(settings, book):
 
     assert updated.status == OrderStatus.CANCELED
     assert fill is None
+
+
+def test_order_manager_posts_maker_one_tick_below_best_bid(settings, context):
+    settings = _maker_settings(settings)
+    settings.paper_maker_bid_offset_cents = 1
+    signal = Signal(
+        action=SignalAction.BUY_UP,
+        confidence=0.9,
+        max_price=0.52,
+        size_usdc=0.25,
+        reason="test maker offset",
+    )
+
+    order, decision = OrderManager(RiskManager(settings), PaperBroker(settings)).execute_paper_signal(signal, context)
+
+    assert decision.approved is True
+    assert order is not None
+    assert order.request.price == 0.48
+    assert order.request.metadata["paper_maker_bid_offset_cents"] == 1
+    assert order.request.metadata["posted_price"] == 0.48
+
+
+def test_maker_price_is_floored_to_tick_capped_and_rejects_invalid_price():
+    assert paper_maker_bid_price(0.496, 0.80, 0) == 0.49
+    assert paper_maker_bid_price(0.60, 0.57, 1) == 0.57
+    assert paper_maker_bid_price(0.01, 0.50, 1) is None
 
 
 def test_open_maker_order_survives_restart_and_reserves_exposure(settings, book):

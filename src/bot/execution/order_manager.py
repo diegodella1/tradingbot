@@ -1,8 +1,21 @@
 from __future__ import annotations
 
+from decimal import Decimal, ROUND_FLOOR
+
 from bot.execution.paper_broker import PaperBroker
 from bot.execution.risk_manager import RiskManager
 from bot.polymarket.models import MarketContext, OrderBook, OrderRequest, OrderSide, OutcomeSide, Signal, SignalAction
+
+
+MAKER_PRICE_TICK = Decimal("0.01")
+
+
+def paper_maker_bid_price(best_bid: float, signal_max_price: float, offset_cents: float) -> float | None:
+    """Return a passive maker bid, floored to the paper market's one-cent tick."""
+    adjusted_bid = Decimal(str(best_bid)) - (Decimal(str(offset_cents)) / Decimal("100"))
+    capped_bid = min(adjusted_bid, Decimal(str(signal_max_price)))
+    price = capped_bid.quantize(MAKER_PRICE_TICK, rounding=ROUND_FLOOR)
+    return float(price) if price >= MAKER_PRICE_TICK else None
 
 
 class OrderManager:
@@ -22,7 +35,13 @@ class OrderManager:
 
         price = signal.max_price
         if self.paper_broker.settings.paper_order_style == "maker":
-            price = book.best_bid
+            if book.best_bid is None:
+                return None, decision
+            price = paper_maker_bid_price(
+                book.best_bid,
+                signal.max_price,
+                self.paper_broker.settings.paper_maker_bid_offset_cents,
+            )
             if price is None:
                 return None, decision
 
@@ -42,6 +61,8 @@ class OrderManager:
                 "risk_size_multiplier": decision.size_multiplier,
                 "execution_style": self.paper_broker.settings.paper_order_style,
                 "signal_max_price": signal.max_price,
+                "paper_maker_bid_offset_cents": self.paper_broker.settings.paper_maker_bid_offset_cents,
+                "posted_price": price,
             },
         )
         order = self.paper_broker.place_limit_order(request, book)

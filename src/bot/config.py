@@ -55,6 +55,7 @@ class Settings(BaseSettings):
     paper_taker_fee_rate: float = 0.07
     paper_order_style: Literal["taker", "maker"] = "taker"
     paper_maker_fill_window_seconds: int = 60
+    paper_maker_bid_offset_cents: float = Field(default=0.0, ge=0.0, le=99.0)
     paper_max_trade_size_usdc: float = 5.0
     paper_loop_interval_seconds: float = 10.0
     paper_bankroll_usdc: float = 10.0
@@ -274,6 +275,7 @@ class Settings(BaseSettings):
             "paper_taker_fee_rate",
             "paper_order_style",
             "paper_maker_fill_window_seconds",
+            "paper_maker_bid_offset_cents",
             "paper_max_trade_size_usdc",
             "paper_experiment_enabled",
             "paper_experiment_stop_loss_usdc",

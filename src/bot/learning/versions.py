@@ -9,6 +9,12 @@ from datetime import UTC, datetime
 from typing import Any
 
 from bot.config import Settings
+from bot.learning.evolution import (
+    EVOLUTION_MIN_DECISION_SAMPLE,
+    config_delta,
+    record_evolution_event,
+    record_policy_checkpoints,
+)
 
 
 PAPER_CONFIG_KEYS = {
@@ -34,6 +40,7 @@ PAPER_CONFIG_KEYS = {
     "paper_trade_size_usdc",
     "paper_order_style",
     "paper_maker_fill_window_seconds",
+    "paper_maker_bid_offset_cents",
     "paper_max_trade_size_usdc",
     "paper_experiment_enabled",
     "paper_experiment_stop_loss_usdc",
@@ -98,6 +105,17 @@ def register_candidate(
         VALUES (?, 'candidate', 0, ?, ?, ?, ?, ?, ?)
         """,
         (version, config_json, config_sha256, oos_json, evidence_sha256, model_sha256, now),
+    )
+    record_evolution_event(
+        conn,
+        event_key=f"policy:{version}:registered",
+        policy_version=version,
+        event_type="registered",
+        title="Policy registered",
+        summary="Immutable paper candidate registered with out-of-sample evidence.",
+        occurred_at=now,
+        config_delta=config_delta(None, clean),
+        evidence_sha256=evidence_sha256,
     )
     conn.commit()
 
@@ -184,8 +202,12 @@ def evaluate_policy(conn: sqlite3.Connection, version: str, settings: Settings) 
 
 
 def evaluate_and_transition(conn: sqlite3.Connection, version: str, settings: Settings) -> PromotionDecision:
+    previous_row = conn.execute(
+        "SELECT status FROM policy_versions WHERE version = ?", (version,)
+    ).fetchone()
     decision = evaluate_policy(conn, version, settings)
     now = datetime.now(UTC).isoformat()
+    record_policy_checkpoints(conn, version, settings.paper_bankroll_usdc)
     conn.execute(
         """
         UPDATE policy_versions
@@ -205,6 +227,20 @@ def evaluate_and_transition(conn: sqlite3.Connection, version: str, settings: Se
         ),
     )
     conn.commit()
+    previous_status = previous_row["status"] if previous_row else None
+    if decision.status != previous_status and decision.status in {"stopped", "rejected", "validated"}:
+        record_evolution_event(
+            conn,
+            event_key=f"policy:{version}:{decision.status}",
+            policy_version=version,
+            event_type=decision.status,
+            title=f"Policy {decision.status}",
+            summary=decision.reason,
+            occurred_at=now,
+            metrics=decision.metrics,
+            reason=decision.reason,
+        )
+        conn.commit()
     if decision.status == "stopped":
         _restore_previous_policy(conn, version)
     return decision
@@ -241,7 +277,41 @@ def activate_paper_experiment(conn: sqlite3.Connection, version: str, settings: 
             "UPDATE policy_versions SET status='paper_active', is_active=1, activated_at=?, rejection_reason=NULL WHERE version=?",
             (now, version),
         )
+        record_evolution_event(
+            conn,
+            event_key=f"policy:{version}:activated",
+            policy_version=version,
+            event_type="activated",
+            title="Paper experiment activated",
+            summary="Guarded maker experiment became the active paper policy.",
+            occurred_at=now,
+            config_delta=config_delta(previous["config"] if previous else None, config),
+            evidence_sha256=row["evidence_sha256"],
+        )
     return PromotionDecision("paper_active", "explicit paper-only maker experiment activated", json.loads(row["oos_metrics_json"] or "{}"))
+
+
+def predecessor_experiment_ready(
+    conn: sqlite3.Connection,
+    version: str,
+    *,
+    min_fills: int = 20,
+) -> tuple[bool, str]:
+    """Allow a successor only after its predecessor matures or reaches a terminal state."""
+    row = conn.execute("SELECT status FROM policy_versions WHERE version = ?", (version,)).fetchone()
+    if row is None:
+        return False, f"predecessor policy not found: {version}"
+    trades = int(
+        conn.execute(
+            "SELECT COUNT(*) FROM positions WHERE policy_version = ? AND status IN ('WON', 'LOST')",
+            (version,),
+        ).fetchone()[0]
+    )
+    if row["status"] in {"stopped", "rejected", "validated"}:
+        return True, f"predecessor {version} is {row['status']} with {trades} fills"
+    if trades >= min_fills:
+        return True, f"predecessor {version} matured with {trades}/{min_fills} fills"
+    return False, f"predecessor {version} still collecting fills {trades}/{min_fills}"
 
 
 def _restore_previous_policy(conn: sqlite3.Connection, stopped_version: str) -> None:
@@ -261,14 +331,41 @@ def _restore_previous_policy(conn: sqlite3.Connection, stopped_version: str) -> 
             "WHERE policy_version=? AND execution_style='maker' AND status IN ('OPEN','PARTIALLY_FILLED')",
             (datetime.now(UTC).isoformat(), stopped_version),
         )
+        restored_at = datetime.now(UTC).isoformat()
+        record_evolution_event(
+            conn,
+            event_key=f"policy:{stopped_version}:rollback:{previous}",
+            policy_version=stopped_version,
+            event_type="rollback",
+            title="Experiment rolled back",
+            summary=f"Pending maker orders canceled and {previous} restored.",
+            occurred_at=restored_at,
+            reason="Automatic safety rollback after experiment stop.",
+        )
 
 
 def rollback_paper_experiment(conn: sqlite3.Connection, version: str, reason: str = "manual rollback") -> str | None:
+    target = conn.execute("SELECT is_active FROM policy_versions WHERE version = ?", (version,)).fetchone()
+    if target is None:
+        raise ValueError(f"unknown policy version: {version}")
+    if not bool(target["is_active"]):
+        active = active_policy(conn)
+        return active["version"] if active else None
     now = datetime.now(UTC).isoformat()
     with conn:
         conn.execute(
             "UPDATE policy_versions SET status='stopped', is_active=0, rejection_reason=?, evaluated_at=? WHERE version=?",
             (reason, now, version),
+        )
+        record_evolution_event(
+            conn,
+            event_key=f"policy:{version}:manual-stop",
+            policy_version=version,
+            event_type="stopped",
+            title="Experiment stopped manually",
+            summary=reason,
+            occurred_at=now,
+            reason=reason,
         )
     _restore_previous_policy(conn, version)
     active = active_policy(conn)
@@ -298,6 +395,7 @@ def activate_candidate(conn: sqlite3.Connection, version: str, settings: Setting
     )
     if not required:
         return PromotionDecision("candidate", "OOS gate requires >=20 trades, positive PnL/ROI and a majority of profitable windows", oos)
+    previous = active_policy(conn)
     now = datetime.now(UTC).isoformat()
     with conn:
         conn.execute(
@@ -322,12 +420,37 @@ def activate_candidate(conn: sqlite3.Connection, version: str, settings: Setting
             """,
             (now, version),
         )
+        config_row = conn.execute(
+            "SELECT config_json, evidence_sha256 FROM policy_versions WHERE version = ?", (version,)
+        ).fetchone()
+        config = json.loads(config_row["config_json"] or "{}")
+        record_evolution_event(
+            conn,
+            event_key=f"policy:{version}:activated",
+            policy_version=version,
+            event_type="activated",
+            title="Paper policy activated",
+            summary="OOS gates passed and candidate became active in paper.",
+            occurred_at=now,
+            config_delta=config_delta(previous["config"] if previous else None, config),
+            evidence_sha256=config_row["evidence_sha256"],
+        )
     return PromotionDecision("paper_active", "OOS gates passed; activated in paper only", oos)
 
 
 def auto_promote_best_candidate(conn: sqlite3.Connection, settings: Settings) -> PromotionDecision | None:
     if not settings.paper_auto_promote:
         return None
+    champion = active_policy(conn)
+    if champion and champion["config"].get("paper_experiment_enabled"):
+        champion_settlements = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM positions WHERE policy_version = ? AND status IN ('WON','LOST')",
+                (champion["version"],),
+            ).fetchone()[0]
+        )
+        if champion_settlements < EVOLUTION_MIN_DECISION_SAMPLE:
+            return None
     candidates = [item for item in list_policies(conn) if item["status"] == "candidate"]
     eligible = [
         item
@@ -376,6 +499,25 @@ def ensure_baseline_policy(conn: sqlite3.Connection, settings: Settings) -> dict
             now,
             now,
         ),
+    )
+    record_evolution_event(
+        conn,
+        event_key=f"policy:{settings.policy_version}:registered",
+        policy_version=settings.policy_version,
+        event_type="registered",
+        title="Baseline policy registered",
+        summary="Configured baseline registered when lifecycle tracking started.",
+        occurred_at=now,
+        config_delta=config_delta(None, config),
+    )
+    record_evolution_event(
+        conn,
+        event_key=f"policy:{settings.policy_version}:activated",
+        policy_version=settings.policy_version,
+        event_type="activated",
+        title="Baseline paper policy activated",
+        summary="Configured baseline became the active paper policy.",
+        occurred_at=now,
     )
     conn.commit()
     return active_policy(conn)
@@ -451,6 +593,9 @@ def _validated_config(config: dict[str, Any]) -> dict[str, Any]:
     unknown = set(config) - PAPER_CONFIG_KEYS
     if unknown:
         raise ValueError(f"unsupported paper policy keys: {', '.join(sorted(unknown))}")
+    maker_offset = float(config.get("paper_maker_bid_offset_cents") or 0)
+    if not 0 <= maker_offset <= 99 or not math.isfinite(maker_offset):
+        raise ValueError("paper_maker_bid_offset_cents must be between 0 and 99")
     return {key: value for key, value in config.items() if key in PAPER_CONFIG_KEYS}
 
 
