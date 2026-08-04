@@ -1,0 +1,22 @@
+{
+  "analysis_type": "forward_order_replay_from_v4_with_conservative_maker_fill_proxy",
+  "assumptions": {
+    "fill_rule": "best ask touches or crosses adjusted bid within 60 seconds",
+    "maker_bid_offset_cents": 1.0,
+    "maker_fee_usdc": 0.0,
+    "min_net_edge_cents": 2.5,
+    "stake_usdc": 0.25
+  },
+  "data_end": "2026-07-28",
+  "data_start": "2026-07-22",
+  "maker_attempts": 10,
+  "maker_fill_rate": 1.0,
+  "max_drawdown_usdc": 0.25,
+  "pnl_usdc": 0.6416625672230332,
+  "profit_factor": 2.2833251344460664,
+  "profitable_windows": 4,
+  "roi": 0.2566650268892133,
+  "trades": 10,
+  "windows": 6,
+  "wins": 8
+}

@@ -1,0 +1,148 @@
+<!doctype html>
+<html class="dark" lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta content="width=device-width, initial-scale=1.0" name="viewport" />
+    <meta content="#0f172a" name="theme-color" />
+    <title>PolyBot BTC - Evolution</title>
+    <script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Hanken+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />
+    <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&display=swap" rel="stylesheet" />
+    <script>
+      tailwind.config = {
+        darkMode: "class",
+        theme: {
+          extend: {
+            colors: {
+              surface: "#0b1326", background: "#0b1326", "surface-container-low": "#131b2e",
+              "surface-container": "#171f33", "surface-container-high": "#222a3d",
+              "surface-container-highest": "#2d3449", outline: "#8c90a2",
+              "outline-variant": "#424656", "on-surface": "#dae2fd",
+              "on-surface-variant": "#c2c6d9", primary: "#b4c5ff", "btc-blue": "#00A3FF",
+              "profit-emerald": "#34D399", "loss-rose": "#FB7185", "warning-amber": "#F59E0B"
+            },
+            fontFamily: { headline: ["Hanken Grotesk", "sans-serif"], body: ["Hanken Grotesk", "sans-serif"], data: ["JetBrains Mono", "monospace"] }
+          }
+        }
+      };
+    </script>
+    <link rel="stylesheet" href="/styles.css?v=20260804-1" />
+  </head>
+  <body class="app-body evolution-body">
+    <a class="sr-only focus:not-sr-only focus:fixed focus:left-4 focus:top-4 focus:z-[100] focus:rounded-lg focus:bg-primary focus:px-4 focus:py-2 focus:text-surface" href="#main">Skip to main content</a>
+    <aside class="app-sidebar" aria-label="Primary navigation">
+      <div class="mb-10 px-4">
+        <div class="brand-title">PolyBot BTC</div>
+        <p class="brand-subtitle">Paper Trading Console</p>
+      </div>
+      <nav class="flex-1 space-y-2">
+        <a class="side-link" href="/"><span class="material-symbols-outlined">dashboard</span><span>Dashboard</span></a>
+        <a class="side-link" href="/strategies.html"><span class="material-symbols-outlined">architecture</span><span>Strategies</span></a>
+        <a class="side-link" href="/analytics.html"><span class="material-symbols-outlined">analytics</span><span>Analytics</span></a>
+        <a class="side-link side-link-active" href="/evolution.html" aria-current="page"><span class="material-symbols-outlined" style="font-variation-settings:'FILL' 1;">timeline</span><span>Evolution</span></a>
+      </nav>
+      <div class="mt-auto rounded-lg border border-btc-blue/25 bg-btc-blue/5 p-4">
+        <div class="text-[10px] font-bold uppercase tracking-[0.16em] text-btc-blue">Public ledger</div>
+        <p class="mt-2 text-xs leading-relaxed text-on-surface-variant">Every result shown here comes from a verified paper settlement or an auditable lifecycle event.</p>
+      </div>
+    </aside>
+
+    <main id="main" class="app-main">
+      <header class="app-topbar">
+        <div class="min-w-0">
+          <div class="topbar-title">Evolution</div>
+          <div id="topbarUpdated" class="truncate text-xs font-data text-outline">Loading experiment ledger</div>
+        </div>
+        <div class="flex items-center gap-3">
+          <span class="status-pill"><span id="ledgerDot" class="status-dot"></span><span id="ledgerStatus">Sync</span></span>
+          <a aria-label="Open dashboard" class="rounded-full p-2 text-on-surface-variant hover:bg-surface-container hover:text-primary md:hidden" href="/"><span class="material-symbols-outlined">dashboard</span></a>
+        </div>
+      </header>
+
+      <div class="app-content evolution-shell">
+        <section class="evolution-hero" aria-labelledby="evolutionTitle">
+          <div class="evolution-hero-copy">
+            <p class="ledger-kicker">Experiment ledger / paper only</p>
+            <h1 id="evolutionTitle">Trading policy, shown as evidence—not a promise.</h1>
+            <p id="plainSummary">Loading current experiment state.</p>
+          </div>
+          <div class="target-seal" aria-label="68 percent reference win rate">
+            <span>Reference rail</span>
+            <strong>68%</strong>
+            <small>WR is secondary to positive expectancy</small>
+          </div>
+        </section>
+
+        <section id="kpiGrid" class="evolution-kpis" aria-label="Current experiment metrics">
+          <article class="ledger-kpi"><span>Active policy</span><strong id="kpiPolicy">--</strong><small id="kpiSampleState">--</small></article>
+          <article class="ledger-kpi"><span>Win rate</span><strong id="kpiWinRate">--</strong><small id="kpiInterval">95% interval --</small></article>
+          <article class="ledger-kpi"><span>Break-even</span><strong id="kpiBreakEven">--</strong><small id="kpiGap">gap --</small></article>
+          <article class="ledger-kpi"><span>Policy PnL</span><strong id="kpiPnl">--</strong><small id="kpiProfitFactor">PF --</small></article>
+          <article class="ledger-kpi"><span>Maker fills</span><strong id="kpiFillRate">--</strong><small id="kpiTrades">-- settlements</small></article>
+        </section>
+
+        <section class="ledger-panel evolution-chart-panel" aria-labelledby="wrChartTitle">
+          <div class="ledger-panel-heading">
+            <div>
+              <p class="ledger-kicker">Accuracy versus price</p>
+              <h2 id="wrChartTitle">Win-rate rail</h2>
+            </div>
+            <div class="chart-legend" aria-label="Chart legend">
+              <span><i class="legend-target"></i>68% reference</span>
+              <span><i class="legend-breakeven"></i>Break-even</span>
+              <span><i class="legend-result"></i>Observed WR</span>
+            </div>
+          </div>
+          <div class="chart-scroll"><svg id="winRateChart" class="evolution-chart" role="img" aria-label="Cumulative win rate by policy and settlement"></svg></div>
+          <p class="chart-help">Select any dot for exact metrics. Policy transitions reset cumulative win rate, preventing old results from leaking into a new experiment.</p>
+        </section>
+
+        <div class="evolution-two-column">
+          <section class="ledger-panel evolution-chart-panel" aria-labelledby="pnlChartTitle">
+            <div class="ledger-panel-heading">
+              <div>
+                <p class="ledger-kicker">All paper eras</p>
+                <h2 id="pnlChartTitle">Global cumulative PnL</h2>
+              </div>
+              <span class="status-pill">Verified settlements</span>
+            </div>
+            <div class="chart-scroll"><svg id="pnlChart" class="evolution-chart evolution-chart-small" role="img" aria-label="Global cumulative paper PnL"></svg></div>
+          </section>
+
+          <aside id="pointDetail" class="ledger-panel point-detail" aria-live="polite" aria-labelledby="pointDetailTitle">
+            <div class="ledger-panel-heading">
+              <div>
+                <p class="ledger-kicker">Selected evidence</p>
+                <h2 id="pointDetailTitle">Latest settlement</h2>
+              </div>
+              <span id="detailOutcome" class="evidence-badge">--</span>
+            </div>
+            <p id="detailWhy" class="point-why">Select a point to inspect it.</p>
+            <dl id="detailMetrics" class="detail-grid"></dl>
+          </aside>
+        </div>
+
+        <section class="ledger-panel" aria-labelledby="policyEraTitle">
+          <div class="ledger-panel-heading">
+            <div><p class="ledger-kicker">Champion and challengers</p><h2 id="policyEraTitle">Policy eras</h2></div>
+          </div>
+          <div id="policyEras" class="policy-era-grid"></div>
+        </section>
+
+        <section class="ledger-panel" aria-labelledby="milestoneTitle">
+          <div class="ledger-panel-heading">
+            <div><p class="ledger-kicker">What changed and why</p><h2 id="milestoneTitle">Key milestones</h2></div>
+            <span id="milestoneCount" class="status-pill">-- events</span>
+          </div>
+          <ol id="milestoneList" class="milestone-list"></ol>
+        </section>
+
+        <section class="method-note" aria-labelledby="methodTitle">
+          <span class="material-symbols-outlined" aria-hidden="true">verified</span>
+          <div><h2 id="methodTitle">How to read this page</h2><p>Win rate is compared with payout-adjusted break-even. A policy is not considered decision-ready before 50 verified settlements, and 68% alone never overrides PnL, profit factor, drawdown, or fill-rate gates.</p></div>
+        </section>
+      </div>
+    </main>
+    <script src="/evolution.js?v=20260804-1"></script>
+  </body>
+</html>

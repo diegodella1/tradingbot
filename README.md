@@ -121,6 +121,20 @@ Train the calibrated probability model:
 python -m bot.cli calibrate
 ```
 
+Run the guarded learning cycle without changing the active model (default):
+
+```bash
+bash scripts/learning_cycle.sh
+```
+
+Model promotion is explicit and blocked until the active experiment has 50
+verified settlements. A successful promotion is written to the evolution
+ledger:
+
+```bash
+PROMOTE_MODEL=true MIN_POLICY_SETTLEMENTS=50 bash scripts/learning_cycle.sh
+```
+
 Refetch closed markets without a verified winner (also runs automatically inside the paper loop every `OUTCOME_BACKFILL_CYCLES`):
 
 ```bash
@@ -139,9 +153,32 @@ Compare maker (post at bid, zero fee) vs taker EV on settled paper trades:
 python -m bot.cli maker-sim
 ```
 
+Replay a persisted maker experiment with a one-cent lower bid and a 2.5-cent
+minimum recorded edge:
+
+```bash
+python -m bot.cli maker-sim \
+  --policy-version btc-updown-v4-maker-experiment \
+  --bid-offset-cents 1 \
+  --min-net-edge-cents 2.5
+```
+
+The guarded v5 experiment keeps `$0.25` paper sizing, posts one cent below the
+best bid, and requires 2.5 cents of net edge. Its activation script refuses to
+supersede v4 until v4 has 20 settled fills or has stopped:
+
+```bash
+PYTHONPATH=src python scripts/activate_margin_maker_experiment.py
+```
+
 ## Public paper dashboard
 
 Dashboard pages and read-only `/api/*` endpoints are public because they expose paper-trading data only. Forced settlement requires `DASHBOARD_ADMIN_TOKEN`, and is limited to one active request and one execution per minute. The browser keeps this token in session storage only.
+
+`/evolution.html` explains policy changes and paper results as an auditable
+timeline. `GET /api/evolution` returns per-settlement win rate, break-even,
+PnL, drawdown, policy eras and lifecycle milestones. Reconstructed historical
+events are labeled separately from events recorded by the live ledger.
 
 `GET /api/healthz` provides a lightweight paper-loop, database and deployed-commit check for service monitoring.
 

@@ -23,10 +23,12 @@ from bot.backtest import (
 )
 from bot.config import Settings, get_settings
 from bot.knowledge.rag import index_markdown, search
+from bot.learning.evolution import record_evolution_event
 from bot.strategy.calibration import accuracy, fit_logistic, log_loss, walk_forward
 from bot.learning.policy import generate_learning_report, persist_learning_recommendations
 from bot.learning.versions import (
     activate_paper_experiment,
+    active_policy,
     apply_active_policy,
     auto_promote_best_candidate,
     ensure_baseline_policy,
@@ -264,17 +266,55 @@ def calibrate(
 @app.command("maker-sim")
 def maker_sim(
     fill_window: float = typer.Option(60.0, min=1.0, help="Seconds a resting maker order stays before cancel."),
+    bid_offset_cents: float = typer.Option(0.0, min=0.0, help="Cents subtracted from the recorded maker bid."),
+    min_net_edge_cents: float = typer.Option(0.0, min=0.0, help="Ignore attempts below this recorded net edge."),
+    policy_version: str | None = typer.Option(None, help="Replay persisted maker attempts for one policy."),
 ) -> None:
-    """Compare maker (post at bid, zero fee) vs taker (actual fills) EV on settled paper trades."""
-    from bot.backtest.maker import maker_vs_taker
+    """Replay maker EV with an optional passive bid offset."""
+    from bot.backtest.maker import maker_vs_taker, replay_maker_orders
 
     settings = _settings()
     with connect(settings.sqlite_path) as conn:
-        result = maker_vs_taker(conn, fill_window_seconds=fill_window)
+        if policy_version:
+            replay = replay_maker_orders(
+                conn,
+                policy_version=policy_version,
+                fill_window_seconds=fill_window,
+                bid_offset_cents=bid_offset_cents,
+                min_net_edge_cents=min_net_edge_cents,
+                bankroll_usdc=settings.paper_bankroll_usdc,
+            )
+        else:
+            result = maker_vs_taker(
+                conn,
+                fill_window_seconds=fill_window,
+                bid_offset_cents=bid_offset_cents,
+            )
+    if policy_version:
+        if replay.attempts == 0:
+            typer.echo(f"maker-sim: no hay intentos maker para {policy_version}")
+            raise typer.Exit(1)
+        typer.echo(
+            f"maker replay policy={policy_version} offset={bid_offset_cents:.2f}c "
+            f"net-edge>={min_net_edge_cents:.2f}c ventana={fill_window:.0f}s"
+        )
+        typer.echo(
+            f"- attempts={replay.attempts} fills={replay.fills} ({_fmt_pct(replay.fill_rate)}) "
+            f"resolved={replay.resolved_fills}"
+        )
+        typer.echo(
+            f"- pnl={replay.pnl_usdc:+.4f} baseline={replay.recorded_pnl_usdc:+.4f} "
+            f"PF={_fmt_num(replay.profit_factor)} DD={replay.max_drawdown_usdc:.4f} "
+            f"({_fmt_pct(replay.max_drawdown_pct)})"
+        )
+        return
     if result.trades == 0:
         typer.echo("maker-sim: no hay trades liquidados con snapshots para simular")
         raise typer.Exit(1)
-    typer.echo(f"maker vs taker (ventana de fill={fill_window:.0f}s, {result.trades} trades liquidados)")
+    typer.echo(
+        f"maker vs taker (ventana={fill_window:.0f}s offset={bid_offset_cents:.2f}c, "
+        f"{result.trades} trades liquidados)"
+    )
     typer.echo(f"- taker real:  pnl={result.taker_pnl_usdc:+.2f} fees={result.taker_fees_usdc:.2f}")
     typer.echo(
         f"- maker sim:   pnl={result.maker_pnl_usdc:+.2f} fees=0.00 "
@@ -453,6 +493,54 @@ def learning_report(persist: bool = typer.Option(True, help="Persist generated r
     for item in report["recommendations"]:
         typer.echo(f"  [{item['status']}] {item['scope']} / {item['metric']}: {item['recommendation']}")
         typer.echo(f"    sample={item['sample_size']} confidence={float(item['confidence']):.2f} reason={item['rationale']}")
+
+
+@app.command("learning-promotion-check")
+def learning_promotion_check(
+    min_policy_settlements: int = typer.Option(50, min=1, help="Minimum active-policy settlements before model promotion."),
+) -> None:
+    """Block model promotion until the active paper policy has enough verified evidence."""
+    settings = _settings()
+    with connect(settings.sqlite_path) as conn:
+        active = active_policy(conn)
+        if active is None:
+            typer.echo("model promotion blocked: no active policy")
+            raise typer.Exit(1)
+        settlements = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM positions WHERE policy_version = ? AND status IN ('WON','LOST')",
+                (active["version"],),
+            ).fetchone()[0]
+        )
+    typer.echo(f"active_policy={active['version']} settlements={settlements}/{min_policy_settlements}")
+    if settlements < min_policy_settlements:
+        raise typer.Exit(1)
+
+
+@app.command("learning-model-promoted")
+def learning_model_promoted(sha256: str = typer.Option(..., help="Promoted model SHA-256.")) -> None:
+    """Append an auditable model-promotion event after an atomic file promotion."""
+    if len(sha256) != 64 or any(character not in "0123456789abcdef" for character in sha256.lower()):
+        typer.echo("invalid model SHA-256")
+        raise typer.Exit(1)
+    settings = _settings()
+    with connect(settings.sqlite_path) as conn:
+        active = active_policy(conn)
+        version = active["version"] if active else None
+        now = datetime.now(UTC).isoformat()
+        record_evolution_event(
+            conn,
+            event_key=f"model:{sha256.lower()}:promoted",
+            policy_version=version,
+            event_type="model_promoted",
+            title="Probability model promoted",
+            summary="A walk-forward candidate beat the market baseline and replaced the active model.",
+            occurred_at=now,
+            reason="Atomic promotion after chronological validation.",
+            evidence_sha256=sha256.lower(),
+        )
+        conn.commit()
+    typer.echo(f"model_promotion_recorded={sha256.lower()} policy={version or 'none'}")
 
 
 @app.command("policy-optimize")

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-from bot.backtest.maker import maker_vs_taker
+from bot.backtest.maker import maker_vs_taker, replay_maker_orders
 from bot.storage.db import connect, init_db
 
 
@@ -24,6 +24,37 @@ def _settled_trade(conn, market_id: str, token_id: str, status: str, price: floa
         VALUES (?, ?, 1.0, ?, ?, ?, ?, ?, ?, ?)
         """,
         (market_id, token_id, price, 1.0 / price, fee, status, pnl, at.isoformat(), at.isoformat()),
+    )
+
+
+def _maker_attempt(
+    conn,
+    market_id: str,
+    token_id: str,
+    *,
+    price: float,
+    status: str,
+    at: datetime,
+    policy_version: str = "v5",
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO orders (
+          order_id, market_id, token_id, side, status, price, size_usdc,
+          policy_version, execution_style, expires_at, updated_at, created_at
+        ) VALUES (?, ?, ?, 'BUY', ?, ?, 0.25, ?, 'maker', ?, ?, ?)
+        """,
+        (
+            f"order-{market_id}",
+            market_id,
+            token_id,
+            status,
+            price,
+            policy_version,
+            (at + timedelta(seconds=60)).isoformat(),
+            at.isoformat(),
+            at.isoformat(),
+        ),
     )
 
 
@@ -78,6 +109,60 @@ def test_maker_loses_full_stake_without_fee_on_lost_market(settings):
     assert result.maker_fills == 1
     assert round(result.maker_pnl_usdc, 2) == -1.0  # no fee on the maker side
     assert round(result.taker_pnl_usdc, 3) == -1.017
+
+
+def test_order_replay_applies_offset_counts_attempts_and_ignores_unfilled_pnl(settings):
+    init_db(settings.sqlite_path)
+    now = datetime.now(UTC)
+    with connect(settings.sqlite_path) as conn:
+        _maker_attempt(conn, "win", "tw", price=0.60, status="FILLED", at=now)
+        _maker_attempt(conn, "miss", "tm", price=0.60, status="CANCELED", at=now)
+        conn.execute(
+            """
+            INSERT INTO positions (
+              market_id, token_id, size_usdc, avg_price, shares, status,
+              realized_pnl_usdc, policy_version, settled_at, updated_at
+            ) VALUES ('win', 'tw', 0.25, 0.60, 0.4167, 'WON', 0.1667, 'v5', ?, ?)
+            """,
+            (now.isoformat(), now.isoformat()),
+        )
+        _snapshot(conn, "win", "tw", 0.58, 0.59, now + timedelta(seconds=20))
+        _snapshot(conn, "miss", "tm", 0.61, 0.62, now + timedelta(seconds=20))
+        conn.commit()
+
+        replay = replay_maker_orders(
+            conn,
+            policy_version="v5",
+            fill_window_seconds=60,
+            bid_offset_cents=1,
+            bankroll_usdc=100,
+        )
+
+    assert replay.attempts == 2
+    assert replay.fills == 1
+    assert replay.resolved_fills == 1
+    assert replay.fill_rate == 0.5
+    assert round(replay.pnl_usdc, 4) == round(0.25 / 0.59 - 0.25, 4)
+    assert replay.recorded_pnl_usdc == 0.1667
+    assert replay.profit_factor == float("inf")
+    assert replay.max_drawdown_usdc == 0
+
+
+def test_order_replay_does_not_invent_pnl_for_touched_order_without_outcome(settings):
+    init_db(settings.sqlite_path)
+    now = datetime.now(UTC)
+    with connect(settings.sqlite_path) as conn:
+        _maker_attempt(conn, "pending", "tp", price=0.60, status="CANCELED", at=now)
+        _snapshot(conn, "pending", "tp", 0.58, 0.59, now + timedelta(seconds=20))
+        conn.commit()
+
+        replay = replay_maker_orders(conn, policy_version="v5", bid_offset_cents=1)
+
+    assert replay.attempts == 1
+    assert replay.fills == 1
+    assert replay.resolved_fills == 0
+    assert replay.pnl_usdc == 0
+    assert replay.profit_factor is None
 
 
 def test_live_order_price_maker_joins_bid(settings, context):

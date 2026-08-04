@@ -199,6 +199,20 @@ CREATE TABLE IF NOT EXISTS policy_versions (
   activated_at TEXT,
   evaluated_at TEXT
 );
+CREATE TABLE IF NOT EXISTS policy_evolution_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_key TEXT NOT NULL UNIQUE,
+  policy_version TEXT,
+  event_type TEXT NOT NULL,
+  source TEXT NOT NULL CHECK(source IN ('recorded', 'reconstructed')),
+  occurred_at TEXT NOT NULL,
+  title TEXT NOT NULL,
+  summary TEXT NOT NULL,
+  metrics_json TEXT,
+  config_delta_json TEXT,
+  reason TEXT,
+  evidence_sha256 TEXT
+);
 CREATE TABLE IF NOT EXISTS schema_migrations (
   version TEXT PRIMARY KEY,
   name TEXT NOT NULL,
@@ -256,6 +270,10 @@ CREATE INDEX IF NOT EXISTS idx_discovery_rejections_created ON discovery_rejecti
 CREATE INDEX IF NOT EXISTS idx_strategy_decisions_created ON strategy_decisions(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_learning_recommendations_created ON learning_recommendations(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_policy_versions_status ON policy_versions(status);
+CREATE INDEX IF NOT EXISTS idx_policy_evolution_occurred
+ON policy_evolution_events(occurred_at, id);
+CREATE INDEX IF NOT EXISTS idx_policy_evolution_version
+ON policy_evolution_events(policy_version, occurred_at);
 CREATE INDEX IF NOT EXISTS idx_discovery_rejection_rollups_last_seen
 ON discovery_rejection_rollups(last_seen_at DESC);
 """
@@ -307,6 +325,47 @@ MIGRATIONS = (
         """
         CREATE UNIQUE INDEX IF NOT EXISTS idx_policy_versions_single_active
         ON policy_versions(is_active) WHERE is_active = 1
+        """,
+    ),
+    (
+        "20260804_policy_evolution_backfill",
+        "backfill auditable policy lifecycle events",
+        """
+        INSERT OR IGNORE INTO policy_evolution_events (
+          event_key, policy_version, event_type, source, occurred_at, title,
+          summary, config_delta_json, reason, evidence_sha256
+        )
+        SELECT
+          'policy:' || version || ':registered', version, 'registered',
+          'reconstructed', created_at, 'Policy registered',
+          'Policy version reconstructed from the immutable registry.',
+          config_json, NULL, evidence_sha256
+        FROM policy_versions;
+
+        INSERT OR IGNORE INTO policy_evolution_events (
+          event_key, policy_version, event_type, source, occurred_at, title,
+          summary, reason, evidence_sha256
+        )
+        SELECT
+          'policy:' || version || ':activated', version, 'activated',
+          'reconstructed', activated_at, 'Paper policy activated',
+          'Activation reconstructed from the policy registry timestamp.',
+          NULL, evidence_sha256
+        FROM policy_versions
+        WHERE activated_at IS NOT NULL;
+
+        INSERT OR IGNORE INTO policy_evolution_events (
+          event_key, policy_version, event_type, source, occurred_at, title,
+          summary, reason, evidence_sha256
+        )
+        SELECT
+          'policy:' || version || ':' || status, version, status,
+          'reconstructed', evaluated_at, 'Policy ' || status,
+          'Terminal state reconstructed from the latest policy evaluation.',
+          rejection_reason, evidence_sha256
+        FROM policy_versions
+        WHERE status IN ('stopped', 'rejected', 'validated')
+          AND evaluated_at IS NOT NULL;
         """,
     ),
 )
@@ -453,7 +512,7 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
         applied = conn.execute("SELECT 1 FROM schema_migrations WHERE version = ?", (version,)).fetchone()
         if applied:
             continue
-        conn.execute(sql)
+        conn.executescript(sql)
         conn.execute(
             "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)",
             (version, name, datetime.now(UTC).isoformat()),

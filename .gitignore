@@ -20,6 +20,8 @@ artifacts/*
 artifacts/policy-evidence/*
 !artifacts/policy-evidence/btc-updown-v4-maker-experiment.json
 !artifacts/policy-evidence/btc-updown-v4-maker-experiment.config.json
+!artifacts/policy-evidence/btc-updown-v5-margin-maker.json
+!artifacts/policy-evidence/btc-updown-v5-margin-maker.config.json
 frontend/downloads/
 
 .agents/

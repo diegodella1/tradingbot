@@ -9,7 +9,8 @@ LOG_DIR="${LEARNING_LOG_DIR:-$ROOT_DIR/logs/learning}"
 MODEL_ACTIVE="${MODEL_ACTIVE:-$ROOT_DIR/probability_model.json}"
 MODEL_CANDIDATE="${MODEL_CANDIDATE:-$ROOT_DIR/probability_model.candidate.json}"
 MODEL_REJECTED="${MODEL_REJECTED:-$ROOT_DIR/probability_model.rejected.json}"
-PROMOTE_MODEL="${PROMOTE_MODEL:-true}"
+PROMOTE_MODEL="${PROMOTE_MODEL:-false}"
+MIN_POLICY_SETTLEMENTS="${MIN_POLICY_SETTLEMENTS:-50}"
 RESTART_PAPER_ON_PROMOTE="${RESTART_PAPER_ON_PROMOTE:-true}"
 
 mkdir -p "$LOG_DIR"
@@ -23,6 +24,7 @@ echo "root=$ROOT_DIR"
 echo "python=$PYTHON_BIN"
 echo "promote_model=$PROMOTE_MODEL"
 echo "restart_paper_on_promote=$RESTART_PAPER_ON_PROMOTE"
+echo "min_policy_settlements=$MIN_POLICY_SETTLEMENTS"
 
 if [ ! -x "$PYTHON_BIN" ]; then
   echo "ERROR python_not_found=$PYTHON_BIN"
@@ -58,6 +60,8 @@ if [ ! -f "$MODEL_CANDIDATE" ]; then
 fi
 
 if [ "$PROMOTE_MODEL" = "true" ]; then
+  "$PYTHON_BIN" -m bot.cli learning-promotion-check \
+    --min-policy-settlements "$MIN_POLICY_SETTLEMENTS"
   STAGED_MODEL="$MODEL_ACTIVE.next.$$"
   cp "$MODEL_CANDIDATE" "$STAGED_MODEL"
   CANDIDATE_SHA256="$(sha256sum "$MODEL_CANDIDATE" | awk '{print $1}')"
@@ -68,6 +72,7 @@ if [ "$PROMOTE_MODEL" = "true" ]; then
     exit 1
   fi
   mv -f "$STAGED_MODEL" "$MODEL_ACTIVE"
+  "$PYTHON_BIN" -m bot.cli learning-model-promoted --sha256 "$CANDIDATE_SHA256"
   echo "model_decision=promoted active_model=$MODEL_ACTIVE sha256=$CANDIDATE_SHA256"
   if [ "$RESTART_PAPER_ON_PROMOTE" = "true" ]; then
     /bin/bash "$ROOT_DIR/scripts/restart_paper.sh"

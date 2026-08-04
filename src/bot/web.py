@@ -15,6 +15,7 @@ from urllib.parse import urlparse
 import httpx
 
 from bot.config import get_settings
+from bot.learning.evolution import build_evolution_payload
 from bot.learning.policy import generate_learning_report
 from bot.learning.versions import apply_active_policy
 from bot.polymarket.gamma import convert_gamma_market, markets_from_event
@@ -38,6 +39,7 @@ TABLES = (
     "rag_documents",
     "learning_notes",
     "learning_recommendations",
+    "policy_evolution_events",
     "discovery_rejections",
     "strategy_decisions",
 )
@@ -51,6 +53,8 @@ _status_cache: tuple[float, str, dict] | None = None
 _status_refreshing = False
 _analytics_lock = threading.Lock()
 _analytics_cache: tuple[float, str, dict] | None = None
+_evolution_lock = threading.Lock()
+_evolution_cache: tuple[float, str, dict] | None = None
 _counts_lock = threading.Lock()
 _counts_cache: tuple[float, str, dict[str, int]] | None = None
 _settlement_lock = threading.Lock()
@@ -81,6 +85,9 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         if path == "/api/learning":
             self._json(learning_payload())
             return
+        if path == "/api/evolution":
+            self._json(evolution_payload())
+            return
         super().do_GET()
 
     def do_POST(self) -> None:
@@ -96,7 +103,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         super().end_headers()
 
     def do_HEAD(self) -> None:
-        if urlparse(self.path).path in {"/api/status", "/api/healthz", "/api/analytics", "/api/strategies", "/api/learning"}:
+        if urlparse(self.path).path in {"/api/status", "/api/healthz", "/api/analytics", "/api/strategies", "/api/learning", "/api/evolution"}:
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.end_headers()
@@ -228,6 +235,7 @@ def _build_status_payload() -> dict:
             "paper_taker_fee_rate": settings.paper_taker_fee_rate,
             "paper_order_style": settings.paper_order_style,
             "paper_maker_fill_window_seconds": settings.paper_maker_fill_window_seconds,
+            "paper_maker_bid_offset_cents": settings.paper_maker_bid_offset_cents,
             "paper_max_trade_size_usdc": settings.paper_max_trade_size_usdc,
             "min_edge_cents": settings.min_edge_cents,
             "max_spread_cents": settings.max_spread_cents,
@@ -334,11 +342,12 @@ def _finish_settlement() -> None:
 
 
 def _reset_dashboard_runtime_state() -> None:
-    global _analytics_cache, _counts_cache, _last_settlement_completed_at, _settlement_running, _status_cache, _status_refreshing
-    with _status_lock, _analytics_lock, _counts_lock, _settlement_lock:
+    global _analytics_cache, _counts_cache, _evolution_cache, _last_settlement_completed_at, _settlement_running, _status_cache, _status_refreshing
+    with _status_lock, _analytics_lock, _evolution_lock, _counts_lock, _settlement_lock:
         _status_cache = None
         _status_refreshing = False
         _analytics_cache = None
+        _evolution_cache = None
         _counts_cache = None
         _settlement_running = False
         _last_settlement_completed_at = None
@@ -532,6 +541,24 @@ def analytics_payload() -> dict:
         return payload
 
 
+def evolution_payload() -> dict:
+    global _evolution_cache
+    settings = get_settings()
+    cache_key = str(settings.sqlite_path.resolve())
+    now = time.monotonic()
+    if _evolution_cache and _evolution_cache[1] == cache_key and now - _evolution_cache[0] < ANALYTICS_CACHE_SECONDS:
+        return _evolution_cache[2]
+    with _evolution_lock:
+        now = time.monotonic()
+        if _evolution_cache and _evolution_cache[1] == cache_key and now - _evolution_cache[0] < ANALYTICS_CACHE_SECONDS:
+            return _evolution_cache[2]
+        with closing(_read_connection(settings.sqlite_path)) as conn:
+            payload = build_evolution_payload(conn, settings.paper_bankroll_usdc)
+        payload["schema_version"] = API_SCHEMA_VERSION
+        _evolution_cache = (time.monotonic(), cache_key, payload)
+        return payload
+
+
 def _build_analytics_payload() -> dict:
     settings = get_settings()
     with closing(_read_connection(settings.sqlite_path)) as conn:
@@ -696,6 +723,7 @@ def strategies_payload() -> dict:
             "paper_taker_fee_rate": settings.paper_taker_fee_rate,
             "paper_order_style": settings.paper_order_style,
             "paper_maker_fill_window_seconds": settings.paper_maker_fill_window_seconds,
+            "paper_maker_bid_offset_cents": settings.paper_maker_bid_offset_cents,
             "paper_max_trade_size_usdc": settings.paper_max_trade_size_usdc,
             "policy_version": settings.policy_version,
             "min_break_even_margin_cents": settings.min_break_even_margin_cents,
