@@ -164,7 +164,7 @@ def test_policy_validates_after_forward_gates(settings):
     init_db(settings.sqlite_path)
     with connect(settings.sqlite_path) as conn:
         _candidate(conn)
-        _settled(conn, "v-test", 20, 16, win_pnl=0.5, loss_pnl=-0.5)
+        _settled(conn, "v-test", 20, 16, win_pnl=0.05, loss_pnl=-0.05)
         decision = evaluate_policy(conn, "v-test", settings)
 
     assert decision.status == "validated"
@@ -203,7 +203,7 @@ def test_validated_policy_remains_the_effective_active_policy(settings):
     with connect(settings.sqlite_path) as conn:
         _candidate(conn)
         activate_candidate(conn, "v-test", settings)
-        _settled(conn, "v-test", 20, 16, win_pnl=0.5, loss_pnl=-0.5)
+        _settled(conn, "v-test", 20, 16, win_pnl=0.05, loss_pnl=-0.05)
 
         decision = evaluate_and_transition(conn, "v-test", settings)
         active = active_policy(conn)
@@ -236,7 +236,7 @@ def test_activating_candidate_supersedes_any_validated_active_policy(settings):
     with connect(settings.sqlite_path) as conn:
         _candidate(conn, "v-one")
         activate_candidate(conn, "v-one", settings)
-        _settled(conn, "v-one", 20, 16, win_pnl=0.5, loss_pnl=-0.5)
+        _settled(conn, "v-one", 20, 16, win_pnl=0.05, loss_pnl=-0.05)
         evaluate_and_transition(conn, "v-one", settings)
         _candidate(conn, "v-two")
 
