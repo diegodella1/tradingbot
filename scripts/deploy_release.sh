@@ -84,7 +84,8 @@ else
     'import bot, httpx, pydantic, structlog, typer, websockets'
   (
     cd "$BUILD_DIR"
-    PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$BUILD_DIR/src" "$BUILD_DIR/.venv/bin/python" -m pytest -q
+    PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$BUILD_DIR/src" \
+      "$BUILD_DIR/.venv/bin/python" -m pytest -q -p no:cacheprovider
   )
   SOURCE_ARCHIVE_SHA256="$(git -C "$ROOT_DIR" archive --format=tar "$SHA" | sha256sum | awk '{print $1}')"
   UV_LOCK_SHA256="$(sha256sum "$BUILD_DIR/uv.lock" | awk '{print $1}')"
