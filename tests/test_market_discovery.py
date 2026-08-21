@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-from bot.polymarket.gamma import convert_gamma_market, discover_from_payload, markets_from_event, recurring_slug_candidates, recurring_slug_window
+import pytest
+
+from bot.config import Settings
+from bot.polymarket.gamma import GammaClient, convert_gamma_market, discover_from_payload, markets_from_event, recurring_slug_candidates, recurring_slug_window
 from bot.polymarket.models import MarketType, OutcomeSide
 
 
@@ -164,3 +167,37 @@ def test_gamma_event_slug_probe_payload_maps_nested_market_tokens():
     assert market.tokens[OutcomeSide.UP].token_id == "up-token"
     assert market.tokens[OutcomeSide.DOWN].token_id == "down-token"
     assert market.mapping_verified is True
+
+
+@pytest.mark.asyncio
+async def test_gamma_discovery_skips_full_scan_when_slug_probe_finds_all_types(monkeypatch):
+    settings = Settings(market_types=["5m"])
+    client = GammaClient(settings)
+    raw_market = {
+        "conditionId": "condition-fast-path",
+        "question": "Bitcoin Up or Down - 5 minute",
+        "slug": "bitcoin-up-or-down-5m",
+        "active": True,
+        "closed": False,
+        "resolved": False,
+        "endDate": (datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
+        "outcomes": '["Up", "Down"]',
+        "clobTokenIds": '["up", "down"]',
+    }
+
+    async def slug_markets():
+        return [raw_market]
+
+    async def unexpected_full_scan(*args, **kwargs):
+        raise AssertionError("full market scan should not run")
+
+    monkeypatch.setattr(client, "recurring_slug_markets", slug_markets)
+    monkeypatch.setattr(client, "list_markets", unexpected_full_scan)
+    monkeypatch.setattr(client, "list_events", unexpected_full_scan)
+    try:
+        result = await client.discover_btc_updown()
+    finally:
+        await client.close()
+
+    assert len(result[MarketType.FIVE_MINUTE]) == 1
+    assert client.last_raw_markets == [raw_market]

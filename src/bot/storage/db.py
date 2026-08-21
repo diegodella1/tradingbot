@@ -418,16 +418,22 @@ def refresh_settlements(conn: sqlite3.Connection, retention_days: int | None = N
 
 
 def prune_old_data(conn: sqlite3.Connection, retention_days: int = 7) -> dict[str, int | str]:
-    """Delete bulk time-series rows older than the retention window.
-
-    Only `market_snapshots` and `btc_ticks` are pruned; decisions, fills and
-    positions are lightweight and stay forever (they feed calibration).
-    """
+    """Delete replaceable telemetry while preserving trading evidence."""
     cutoff = (datetime.now(UTC) - timedelta(days=retention_days)).isoformat()
-    snapshots = conn.execute("DELETE FROM market_snapshots WHERE created_at < ?", (cutoff,)).rowcount
-    ticks = conn.execute("DELETE FROM btc_ticks WHERE created_at < ?", (cutoff,)).rowcount
-    conn.commit()
-    return {"market_snapshots_deleted": int(snapshots), "btc_ticks_deleted": int(ticks), "cutoff": cutoff}
+    statements = {
+        "market_snapshots": "DELETE FROM market_snapshots WHERE created_at < ?",
+        "btc_ticks": "DELETE FROM btc_ticks WHERE created_at < ?",
+        "signals": "DELETE FROM signals WHERE action = 'HOLD' AND created_at < ?",
+        "strategy_decisions": "DELETE FROM strategy_decisions WHERE action = 'HOLD' AND created_at < ?",
+        "risk_events": "DELETE FROM risk_events WHERE created_at < ?",
+        "health_events": "DELETE FROM health_events WHERE created_at < ?",
+        "learning_notes": "DELETE FROM learning_notes WHERE created_at < ?",
+    }
+    deleted: dict[str, int | str] = {"cutoff": cutoff}
+    with conn:
+        for table, statement in statements.items():
+            deleted[f"{table}_deleted"] = int(conn.execute(statement, (cutoff,)).rowcount)
+    return deleted
 
 
 def maybe_prune_old_data(conn: sqlite3.Connection, retention_days: int, min_interval_hours: float = 24.0) -> dict | None:

@@ -93,19 +93,26 @@ def test_split_rows_by_market_is_chronological_and_disjoint():
     assert max(row.epoch for row in train) < min(row.epoch for row in test)
 
 
-def test_run_walk_forward_sweep_reports_both_cell_sets():
+def test_run_walk_forward_sweep_reports_three_disjoint_cell_sets():
     rows = [_row(f"m{i}", "UP", 0.70, 1 if i % 4 else 0, 400, float(i)) for i in range(50)]
     report = run_walk_forward_sweep(
         rows, fee_rate=0.0, min_probabilities=(0.55,), min_seconds=(45,), price_bands=((0.10, 0.90),)
     )
-    assert report["train_markets"] == 40
+    assert report["train_markets"] == 30
+    assert report["validation_markets"] == 10
     assert report["test_markets"] == 10
     train_cell = next(c for c in report["train_cells"] if not c.only_15m)
+    validation_cell = next(c for c in report["validation_cells"] if not c.only_15m)
     test_cell = next(c for c in report["test_cells"] if not c.only_15m)
-    assert train_cell.trades <= 40
+    assert train_cell.trades <= 30
+    assert validation_cell.trades <= 10
     assert test_cell.trades <= 10
-    # trades in test cells only come from held-out markets
-    assert train_cell.trades + test_cell.trades <= 50
+    assert train_cell.trades + validation_cell.trades + test_cell.trades <= 50
+    market_sets = [
+        {row.market_id for row in report[key]}
+        for key in ("train", "validation", "test")
+    ]
+    assert not (market_sets[0] & market_sets[1] or market_sets[0] & market_sets[2] or market_sets[1] & market_sets[2])
 
 
 def test_run_walk_forward_sweep_needs_enough_data():

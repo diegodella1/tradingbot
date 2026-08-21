@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from bot.storage.db import connect, init_db
 from bot.storage.maintenance import compact_database
@@ -7,6 +7,7 @@ from bot.storage.maintenance import compact_database
 def test_compaction_preserves_source_and_actionable_records(settings, tmp_path):
     init_db(settings.sqlite_path)
     created_at = datetime.now(UTC).replace(second=10, microsecond=0).isoformat()
+    old_created_at = (datetime.now(UTC) - timedelta(days=30)).isoformat()
     with connect(settings.sqlite_path) as conn:
         for _ in range(2):
             conn.execute(
@@ -22,6 +23,12 @@ def test_compaction_preserves_source_and_actionable_records(settings, tmp_path):
                 (created_at,),
             )
         conn.commit()
+        conn.execute("INSERT INTO btc_ticks (price, created_at) VALUES (60000, ?)", (old_created_at,))
+        conn.execute(
+            "INSERT INTO market_snapshots (market_id, token_id, created_at) VALUES ('old', 'token', ?)",
+            (old_created_at,),
+        )
+        conn.commit()
 
     output = tmp_path / "compacted.sqlite3"
     result = compact_database(settings.sqlite_path, output, tmp_path / "backups")
@@ -34,6 +41,8 @@ def test_compaction_preserves_source_and_actionable_records(settings, tmp_path):
         assert compacted.execute("SELECT occurrences FROM discovery_rejection_rollups").fetchone()[0] == 2
         assert compacted.execute("SELECT COUNT(*) FROM signals WHERE action = 'HOLD'").fetchone()[0] == 1
         assert compacted.execute("SELECT COUNT(*) FROM signals WHERE action = 'BUY_UP'").fetchone()[0] == 2
+        assert compacted.execute("SELECT COUNT(*) FROM btc_ticks").fetchone()[0] == 0
+        assert compacted.execute("SELECT COUNT(*) FROM market_snapshots").fetchone()[0] == 0
         assert compacted.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
 
     assert result["integrity_check"] == "ok"

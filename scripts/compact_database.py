@@ -13,8 +13,9 @@ def main() -> None:
     parser.add_argument("source", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--backup-directory", type=Path, required=True)
+    parser.add_argument("--retention-days", type=int, default=7)
     args = parser.parse_args()
-    result = compact_database(args.source, args.output, args.backup_directory)
+    result = compact_database(args.source, args.output, args.backup_directory, args.retention_days)
     print(json.dumps({key: str(value) if isinstance(value, Path) else value for key, value in result.items()}, sort_keys=True))
 
 

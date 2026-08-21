@@ -12,6 +12,7 @@ from bot.backtest.engine import (
 )
 from bot.backtest.sweep import (
     SweepCell,
+    ValidatedPolicy,
     policy_config,
     policy_evidence,
     recommend,
@@ -19,12 +20,15 @@ from bot.backtest.sweep import (
     recommended_env_lines,
     run_sweep,
     run_walk_forward_sweep,
+    select_validated_policy,
     split_rows_by_market,
+    walk_forward_by_market,
 )
 
 __all__ = [
     "BacktestSample",
     "SweepCell",
+    "ValidatedPolicy",
     "TrainingRow",
     "bucket_breakdown",
     "build_training_rows",
@@ -38,7 +42,9 @@ __all__ = [
     "run_backtest",
     "run_sweep",
     "run_walk_forward_sweep",
+    "select_validated_policy",
     "sample_pnl",
     "split_rows_by_market",
+    "walk_forward_by_market",
     "summarize",
 ]

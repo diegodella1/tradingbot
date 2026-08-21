@@ -7,7 +7,7 @@ from contextlib import suppress
 import structlog
 
 from bot.config import Settings
-from bot.btc.price_feed import CoinbaseBtcFeed
+from bot.btc.price_feed import CoinbaseBtcFeed, exception_detail
 from bot.execution.live_broker import LiveBroker
 from bot.execution.live_tracker import LiveOrderTracker
 from bot.execution.risk_manager import RiskManager
@@ -65,7 +65,12 @@ async def run_live_loop(settings: Settings, max_cycles: int | None = None) -> No
     risk = RiskManager(settings)
     broker = LiveBroker(settings, risk)
     tracker = LiveOrderTracker()
-    strategy = MomentumBookImbalanceStrategy(settings) if settings.enable_experimental_strategy else NoTradeStrategy()
+    observer_only = settings.policy_mode == "observe"
+    strategy = (
+        MomentumBookImbalanceStrategy(settings, observer_only=observer_only)
+        if settings.enable_experimental_strategy or observer_only
+        else NoTradeStrategy()
+    )
     realtime = RealtimeMarketData(settings, btc_feed) if settings.enable_websocket_feeds else None
     stop = asyncio.Event()
 
@@ -81,7 +86,7 @@ async def run_live_loop(settings: Settings, max_cycles: int | None = None) -> No
 
     cycles = 0
     with connect(settings.sqlite_path) as conn:
-        repo = Repository(conn)
+        repo = Repository(conn, raw_sample_seconds=settings.telemetry_sample_seconds)
         risk.state = repo.hydrate_risk_state(settings.loss_streak_window_minutes)
         try:
             while not stop.is_set():
@@ -97,6 +102,9 @@ async def run_live_loop(settings: Settings, max_cycles: int | None = None) -> No
             if realtime is not None:
                 with suppress(Exception):
                     await realtime.stop()
+            else:
+                with suppress(Exception):
+                    await btc_feed.stop()
             with suppress(Exception):
                 await asyncio.wait_for(gamma.close(), timeout=2)
             with suppress(Exception):
@@ -113,8 +121,9 @@ async def _live_cycle(settings, gamma, clob, btc_feed, broker, tracker, risk, st
         if btc_state.current_price is not None:
             repo.save_btc_tick(btc_state.current_price)
     except Exception as exc:
-        repo.save_health_event("btc_feed", "blocked", str(exc))
-        log.warning("live_btc_feed_failed", error=str(exc))
+        detail = exception_detail(exc)
+        repo.save_health_event("btc_feed", "blocked", detail)
+        log.warning("live_btc_feed_failed", error=detail)
         return
 
     try:

@@ -11,6 +11,26 @@ def _seed(conn, created_at: str) -> None:
         (created_at,),
     )
     conn.execute("INSERT INTO btc_ticks (price, created_at) VALUES (100.0, ?)", (created_at,))
+    conn.execute(
+        "INSERT INTO signals (market_id, action, confidence, max_price, size_usdc, reason, created_at) VALUES ('m', 'HOLD', 0, 0, 0, 'same', ?)",
+        (created_at,),
+    )
+    conn.execute(
+        "INSERT INTO strategy_decisions (market_id, action, confidence, reason, created_at) VALUES ('m', 'HOLD', 0, 'same', ?)",
+        (created_at,),
+    )
+    conn.execute(
+        "INSERT INTO risk_events (market_id, approved, reason, created_at) VALUES ('m', 0, 'same', ?)",
+        (created_at,),
+    )
+    conn.execute(
+        "INSERT INTO health_events (name, status, detail, created_at) VALUES ('paper_loop', 'ok', 'same', ?)",
+        (created_at,),
+    )
+    conn.execute(
+        "INSERT INTO learning_notes (note, tags, created_at) VALUES ('same', 'paper', ?)",
+        (created_at,),
+    )
 
 
 def test_prune_deletes_only_rows_older_than_retention(settings):
@@ -25,8 +45,14 @@ def test_prune_deletes_only_rows_older_than_retention(settings):
 
         assert result["market_snapshots_deleted"] == 1
         assert result["btc_ticks_deleted"] == 1
+        assert result["signals_deleted"] == 1
+        assert result["strategy_decisions_deleted"] == 1
+        assert result["risk_events_deleted"] == 1
+        assert result["health_events_deleted"] == 1
+        assert result["learning_notes_deleted"] == 1
         assert conn.execute("SELECT COUNT(*) FROM market_snapshots").fetchone()[0] == 1
         assert conn.execute("SELECT COUNT(*) FROM btc_ticks").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM positions").fetchone()[0] == 0
 
 
 def test_maybe_prune_runs_at_most_once_per_interval(settings):

@@ -88,6 +88,8 @@ class ProbabilityModel:
     feature_names: list[str] = field(default_factory=lambda: list(FEATURE_NAMES))
     trained_samples: int = 0
     anchored: bool = True
+    schema_version: int = 1
+    training_metadata: dict = field(default_factory=dict)
 
     def predict_proba(self, features: list[float]) -> float:
         # weights/means/stds cover the extras (all but the trailing anchor), so
@@ -99,6 +101,32 @@ class ProbabilityModel:
 
     def is_compatible(self) -> bool:
         return list(self.feature_names) == FEATURE_NAMES and len(self.weights) == len(FEATURE_NAMES) - 1
+
+    def is_trade_approved(self) -> bool:
+        oos = self.training_metadata.get("oos") or {}
+        dataset_sha256 = str(self.training_metadata.get("dataset_sha256") or "")
+        try:
+            distinct_markets = int(self.training_metadata.get("distinct_markets") or 0)
+            test_markets = int(oos.get("test_markets") or 0)
+            model_log_loss = float(oos["test_log_loss"])
+            market_log_loss = float(oos["market_log_loss"])
+            model_brier = float(oos["test_brier_score"])
+            market_brier = float(oos["market_brier_score"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        return (
+            self.schema_version >= 2
+            and self.is_compatible()
+            and distinct_markets >= 30
+            and bool(self.training_metadata.get("data_start"))
+            and bool(self.training_metadata.get("data_end"))
+            and len(dataset_sha256) == 64
+            and all(character in "0123456789abcdef" for character in dataset_sha256.lower())
+            and bool(oos.get("beats_market"))
+            and test_markets >= 30
+            and model_log_loss < market_log_loss
+            and model_brier < market_brier
+        )
 
     def to_json(self) -> str:
         return json.dumps(asdict(self))
@@ -190,8 +218,18 @@ def _log_loss_probs(probabilities: list[float], labels: list[int]) -> float:
     return total / len(probabilities)
 
 
+def probability_log_loss(probabilities: list[float], labels: list[int]) -> float:
+    return _log_loss_probs(probabilities, labels)
+
+
 def log_loss(model: ProbabilityModel, rows: list[list[float]], labels: list[int]) -> float:
     return _log_loss_probs([model.predict_proba(row) for row in rows], labels)
+
+
+def brier_score(probabilities: list[float], labels: list[int]) -> float:
+    if not probabilities:
+        return 0.0
+    return sum((probability - label) ** 2 for probability, label in zip(probabilities, labels, strict=False)) / len(probabilities)
 
 
 def accuracy(model: ProbabilityModel, rows: list[list[float]], labels: list[int]) -> float:
@@ -235,6 +273,8 @@ def walk_forward(
         "train_log_loss": log_loss(model, rows[:cut], labels[:cut]),
         "test_log_loss": _log_loss_probs(probabilities, test_labels),
         "market_log_loss": _log_loss_probs(market_probabilities, test_labels),
+        "test_brier_score": brier_score(probabilities, test_labels),
+        "market_brier_score": brier_score(market_probabilities, test_labels),
         "test_accuracy": sum(1 for p, label in zip(probabilities, test_labels, strict=False) if (p >= 0.5) == bool(label)) / len(test_rows) if test_rows else 0.0,
         "wr_by_cutoff": wr_by_cutoff,
     }

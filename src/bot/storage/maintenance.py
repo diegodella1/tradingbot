@@ -5,7 +5,7 @@ import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
-from bot.storage.db import init_db
+from bot.storage.db import init_db, prune_old_data
 
 
 DEDUPLICATION_RULES = {
@@ -17,7 +17,7 @@ DEDUPLICATION_RULES = {
 }
 
 
-def compact_database(source: Path, output: Path, backup_directory: Path) -> dict:
+def compact_database(source: Path, output: Path, backup_directory: Path, retention_days: int = 7) -> dict:
     source = source.resolve()
     output = output.resolve()
     backup_directory = backup_directory.resolve()
@@ -47,6 +47,7 @@ def compact_database(source: Path, output: Path, backup_directory: Path) -> dict
             _roll_up_legacy_rejections(connection)
             for table, (predicate, partition) in DEDUPLICATION_RULES.items():
                 _deduplicate(connection, table, predicate, partition)
+        pruned = prune_old_data(connection, retention_days)
         connection.execute("ANALYZE")
         connection.execute("PRAGMA optimize")
         connection.execute("VACUUM")
@@ -66,6 +67,7 @@ def compact_database(source: Path, output: Path, backup_directory: Path) -> dict
         "integrity_check": integrity,
         "before": before,
         "after": after,
+        "pruned": pruned,
     }
 
 

@@ -23,8 +23,10 @@ def _parse_utc(value: str | None) -> datetime | None:
 
 
 class Repository:
-    def __init__(self, conn: sqlite3.Connection):
+    def __init__(self, conn: sqlite3.Connection, raw_sample_seconds: int = 0):
         self.conn = conn
+        self.raw_sample_seconds = max(0, raw_sample_seconds)
+        self._last_raw_sample: dict[str, datetime] = {}
 
     def save_market(self, market: UpDownMarket) -> None:
         self.conn.execute(
@@ -116,6 +118,8 @@ class Repository:
         self.conn.commit()
 
     def save_snapshot(self, book: OrderBook) -> None:
+        if not self._raw_sample_due(f"book:{book.token_id}"):
+            return
         self.conn.execute(
             """
             INSERT INTO market_snapshots (market_id, token_id, best_bid, best_ask, spread, liquidity, imbalance, created_at)
@@ -126,8 +130,20 @@ class Repository:
         self.conn.commit()
 
     def save_btc_tick(self, price: float) -> None:
+        if not self._raw_sample_due("btc"):
+            return
         self.conn.execute("INSERT INTO btc_ticks (price, created_at) VALUES (?, ?)", (price, now_text()))
         self.conn.commit()
+
+    def _raw_sample_due(self, key: str) -> bool:
+        if self.raw_sample_seconds <= 0:
+            return True
+        now = datetime.now(UTC)
+        previous = self._last_raw_sample.get(key)
+        if previous is not None and (now - previous).total_seconds() < self.raw_sample_seconds:
+            return False
+        self._last_raw_sample[key] = now
+        return True
 
     def get_market_open_price(self, market_id: str) -> float | None:
         row = self.conn.execute("SELECT price FROM market_open_prices WHERE market_id = ?", (market_id,)).fetchone()

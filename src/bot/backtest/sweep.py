@@ -7,7 +7,7 @@ from bot.backtest.dataset import TrainingRow
 from bot.config import Settings
 from bot.execution.paper_broker import polymarket_taker_fee_usdc
 from bot.strategy.momentum_book_imbalance import kelly_fraction
-from bot.strategy.calibration import ProbabilityModel, fit_logistic
+from bot.strategy.calibration import ProbabilityModel, brier_score, fit_logistic, probability_log_loss
 
 DEFAULT_MIN_PROBABILITIES = (0.55, 0.60, 0.65, 0.70, 0.75)
 DEFAULT_MIN_SECONDS = (45, 180, 300, 420)
@@ -48,6 +48,12 @@ class SweepCell:
     @property
     def trades_per_day(self) -> float:
         return self.trades / max(1, self.days)
+
+
+@dataclass(frozen=True)
+class ValidatedPolicy:
+    selected_on_validation: SweepCell
+    verified_on_test: SweepCell
 
 
 @dataclass
@@ -265,6 +271,61 @@ def split_rows_by_market(rows: list[TrainingRow], split: float = 0.8) -> tuple[l
     return train, test
 
 
+def _three_way_market_split(
+    rows: list[TrainingRow],
+    train_fraction: float = 0.6,
+    validation_fraction: float = 0.2,
+) -> tuple[list[TrainingRow], list[TrainingRow], list[TrainingRow]]:
+    """Chronological train/selection/test split with disjoint market ids."""
+    first_epoch: dict[str, float] = {}
+    for row in rows:
+        first_epoch[row.market_id] = min(first_epoch.get(row.market_id, row.epoch), row.epoch)
+    ordered_markets = sorted(first_epoch, key=lambda market_id: (first_epoch[market_id], market_id))
+    if len(ordered_markets) < 3:
+        raise ValueError("at least three markets are required for train/validation/test")
+    train_cut = max(1, int(len(ordered_markets) * train_fraction))
+    validation_cut = max(train_cut + 1, int(len(ordered_markets) * (train_fraction + validation_fraction)))
+    validation_cut = min(validation_cut, len(ordered_markets) - 1)
+    train_markets = set(ordered_markets[:train_cut])
+    validation_markets = set(ordered_markets[train_cut:validation_cut])
+    test_markets = set(ordered_markets[validation_cut:])
+    train = [row for row in rows if row.market_id in train_markets]
+    validation = [row for row in rows if row.market_id in validation_markets]
+    test = [row for row in rows if row.market_id in test_markets]
+    if not train or not validation or not test:
+        raise ValueError("not enough data for train/validation/test")
+    return train, validation, test
+
+
+def walk_forward_by_market(rows: list[TrainingRow], split: float = 0.8) -> dict:
+    """Fit and score at market boundaries so correlated cycles never leak."""
+    train_rows, test_rows = split_rows_by_market(rows, split)
+    if not train_rows or not test_rows:
+        raise ValueError("not enough data to split train/test")
+    model = fit_logistic([row.features for row in train_rows], [row.label for row in train_rows])
+    labels = [row.label for row in test_rows]
+    model_probabilities = [model.predict_proba(row.features) for row in test_rows]
+    market_probabilities = [row.ask for row in test_rows]
+    model_log_loss = probability_log_loss(model_probabilities, labels)
+    market_log_loss = probability_log_loss(market_probabilities, labels)
+    model_brier = brier_score(model_probabilities, labels)
+    market_brier = brier_score(market_probabilities, labels)
+    return {
+        "model": model,
+        "train": train_rows,
+        "test": test_rows,
+        "train_rows": len(train_rows),
+        "test_rows": len(test_rows),
+        "train_markets": len({row.market_id for row in train_rows}),
+        "test_markets": len({row.market_id for row in test_rows}),
+        "test_log_loss": model_log_loss,
+        "market_log_loss": market_log_loss,
+        "test_brier_score": model_brier,
+        "market_brier_score": market_brier,
+        "beats_market": model_log_loss < market_log_loss and model_brier < market_brier,
+    }
+
+
 def run_walk_forward_sweep(
     rows: list[TrainingRow],
     fee_rate: float,
@@ -275,14 +336,18 @@ def run_walk_forward_sweep(
     min_net_edges: tuple[float, ...] = (0.0,),
     settings: Settings | None = None,
 ) -> dict:
-    """Out-of-sample sweep: fit the model on the first 80% of markets, then grid-search
-    gates on BOTH sets with that model. Only the test cells are honest estimates; the
-    train cells are reported to expose the in-sample optimism per configuration.
-    """
-    train_rows, test_rows = split_rows_by_market(rows, split)
-    if not train_rows or not test_rows:
-        raise ValueError("not enough data to split train/test")
+    """Select gates on validation markets and verify once on untouched test markets."""
+    if split != 0.8:
+        raise ValueError("policy sweep uses a fixed 60/20/20 market split")
+    train_rows, validation_rows, test_rows = _three_way_market_split(rows)
     model = fit_logistic([row.features for row in train_rows], [row.label for row in train_rows])
+    test_labels = [row.label for row in test_rows]
+    model_probabilities = [model.predict_proba(row.features) for row in test_rows]
+    market_probabilities = [row.ask for row in test_rows]
+    model_log_loss = probability_log_loss(model_probabilities, test_labels)
+    market_log_loss = probability_log_loss(market_probabilities, test_labels)
+    model_brier = brier_score(model_probabilities, test_labels)
+    market_brier = brier_score(market_probabilities, test_labels)
     grids = {
         "min_probabilities": min_probabilities,
         "min_seconds": min_seconds,
@@ -292,11 +357,22 @@ def run_walk_forward_sweep(
     }
     return {
         "model": model,
+        "train": train_rows,
+        "validation": validation_rows,
+        "test": test_rows,
         "train_rows": len(train_rows),
+        "validation_rows": len(validation_rows),
         "test_rows": len(test_rows),
         "train_markets": len({row.market_id for row in train_rows}),
+        "validation_markets": len({row.market_id for row in validation_rows}),
         "test_markets": len({row.market_id for row in test_rows}),
+        "test_log_loss": model_log_loss,
+        "market_log_loss": market_log_loss,
+        "test_brier_score": model_brier,
+        "market_brier_score": market_brier,
+        "beats_market": model_log_loss < market_log_loss and model_brier < market_brier,
         "train_cells": run_sweep(train_rows, model, fee_rate, **grids),
+        "validation_cells": run_sweep(validation_rows, model, fee_rate, **grids),
         "test_cells": run_sweep(test_rows, model, fee_rate, **grids),
     }
 
@@ -351,9 +427,47 @@ def recommend_policy(
     )
 
 
+def select_validated_policy(
+    report: dict,
+    *,
+    target_min_per_day: float = 2.0,
+    target_max_per_day: float = 6.0,
+    min_trades: int = 30,
+    min_profit_factor: float = 1.25,
+    max_drawdown_pct: float = 0.03,
+) -> ValidatedPolicy | None:
+    """Choose on validation, then require the identical gates to pass final test."""
+    gate_kwargs = {
+        "target_min_per_day": target_min_per_day,
+        "target_max_per_day": target_max_per_day,
+        "min_trades": min_trades,
+        "min_profit_factor": min_profit_factor,
+        "max_drawdown_pct": max_drawdown_pct,
+    }
+    selected = recommend_policy(report["validation_cells"], **gate_kwargs)
+    if selected is None:
+        return None
+    identity = _cell_identity(selected)
+    tested = next((cell for cell in report["test_cells"] if _cell_identity(cell) == identity), None)
+    if tested is None or recommend_policy([tested], **gate_kwargs) is None:
+        return None
+    return ValidatedPolicy(selected_on_validation=selected, verified_on_test=tested)
+
+
+def _cell_identity(cell: SweepCell) -> tuple:
+    return (
+        cell.min_probability,
+        cell.min_seconds_to_close,
+        cell.price_band,
+        cell.min_net_edge_cents,
+        cell.only_15m,
+    )
+
+
 def policy_config(cell: SweepCell) -> dict:
     """Allowlisted paper overrides matching the selected sweep cell."""
     return {
+        "enable_experimental_strategy": True,
         "market_types": ["15m"],
         "enable_5m_scout": False,
         "min_estimated_probability": cell.min_probability,
@@ -367,14 +481,20 @@ def policy_config(cell: SweepCell) -> dict:
         "min_seconds_to_close_15m": cell.min_seconds_to_close,
         "max_trades_per_hour": 2,
         "max_trades_per_day": 6,
+        "paper_order_style": "maker",
+        "paper_max_trade_size_usdc": 0.25,
+        "paper_experiment_enabled": True,
+        "paper_experiment_min_fills": 50,
+        "paper_experiment_min_profit_factor": 1.25,
     }
 
 
-def policy_evidence(cell: SweepCell, report: dict) -> dict:
+def policy_evidence(cell: SweepCell, report: dict, selection_cell: SweepCell | None = None) -> dict:
     profit_factor = cell.profit_factor
     return {
-        "method": "chronological_market_split_80_20_full_gates",
+        "method": "chronological_market_split_60_20_20_nested_gates",
         "train_markets": report["train_markets"],
+        "validation_markets": report["validation_markets"],
         "test_markets": report["test_markets"],
         "trades": cell.trades,
         "wins": cell.wins,
@@ -387,6 +507,24 @@ def policy_evidence(cell: SweepCell, report: dict) -> dict:
         "windows": cell.windows,
         "profitable_windows": cell.profitable_windows,
         "target_entries_per_day": [2, 6],
+        "selection_metrics": (
+            {
+                "trades": selection_cell.trades,
+                "pnl_usdc": selection_cell.pnl_usdc,
+                "profit_factor": 999.0 if selection_cell.profit_factor == float("inf") else selection_cell.profit_factor,
+                "max_drawdown_pct": selection_cell.max_drawdown_pct,
+                "trades_per_day": selection_cell.trades_per_day,
+            }
+            if selection_cell is not None
+            else None
+        ),
+        "model_validation": {
+            "test_log_loss": report["test_log_loss"],
+            "market_log_loss": report["market_log_loss"],
+            "test_brier_score": report["test_brier_score"],
+            "market_brier_score": report["market_brier_score"],
+            "beats_market": report["beats_market"],
+        },
         "config": policy_config(cell),
     }
 

@@ -250,6 +250,12 @@ class GammaClient:
 
     async def discover_btc_updown(self) -> dict[MarketType, list[UpDownMarket]]:
         raw_markets = await self.recurring_slug_markets()
+        discovered = discover_from_payload(raw_markets, self.settings.market_types)
+        wanted = {MarketType(item) for item in self.settings.market_types}
+        if all(discovered.get(market_type) for market_type in wanted):
+            self.last_raw_markets = raw_markets
+            return discovered
+
         raw_markets.extend(await self.list_markets())
         for event in await self.list_events():
             if looks_like_btc_updown(event):

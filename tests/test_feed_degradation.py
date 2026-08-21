@@ -5,14 +5,20 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from bot.btc.price_feed import CoinbaseBtcFeed
+from bot.btc.price_feed import CoinbaseBtcFeed, exception_detail
 from bot.main import _btc_state_for_cycle, _track_feed_degradation
 from bot.storage.db import connect, init_db
 from bot.storage.repositories import Repository
 
 
 def _realtime() -> SimpleNamespace:
-    return SimpleNamespace(rest_fallback_active=False, ever_streamed=False, connected=False)
+    return SimpleNamespace(
+        rest_fallback_active=False,
+        ever_streamed=False,
+        connected=False,
+        consecutive_rest_cycles=0,
+        consecutive_stream_cycles=0,
+    )
 
 
 def _last_btc_feed_event(conn) -> dict | None:
@@ -33,12 +39,16 @@ def test_warmup_rest_polling_does_not_alert(settings):
 
 
 def test_degradation_after_streaming_alerts_once(settings):
+    settings.feed_failure_threshold = 3
     init_db(settings.sqlite_path)
     realtime = _realtime()
     with connect(settings.sqlite_path) as conn:
         repo = Repository(conn)
         _track_feed_degradation(settings, repo, realtime, using_rest=False)  # streamed
-        _track_feed_degradation(settings, repo, realtime, using_rest=True)   # falls back
+        _track_feed_degradation(settings, repo, realtime, using_rest=True)
+        _track_feed_degradation(settings, repo, realtime, using_rest=True)
+        assert _last_btc_feed_event(conn) is None
+        _track_feed_degradation(settings, repo, realtime, using_rest=True)   # threshold reached
         assert realtime.rest_fallback_active is True
         event = _last_btc_feed_event(conn)
         assert event["status"] == "degraded"
@@ -50,12 +60,16 @@ def test_degradation_after_streaming_alerts_once(settings):
 
 
 def test_recovery_emits_recovered_event(settings):
+    settings.feed_failure_threshold = 2
     init_db(settings.sqlite_path)
     realtime = _realtime()
     with connect(settings.sqlite_path) as conn:
         repo = Repository(conn)
         _track_feed_degradation(settings, repo, realtime, using_rest=False)
         _track_feed_degradation(settings, repo, realtime, using_rest=True)
+        _track_feed_degradation(settings, repo, realtime, using_rest=True)
+        _track_feed_degradation(settings, repo, realtime, using_rest=False)
+        assert realtime.rest_fallback_active is True
         _track_feed_degradation(settings, repo, realtime, using_rest=False)
         assert realtime.rest_fallback_active is False
         event = _last_btc_feed_event(conn)
@@ -103,3 +117,8 @@ async def test_fresh_stream_does_not_poll_rest(settings, monkeypatch):
 
     assert source == "websocket"
     assert state.current_price == 60_000
+
+
+def test_exception_detail_never_returns_empty_reason():
+    assert exception_detail(Exception()) == "Exception: no message"
+    assert exception_detail(TimeoutError("late")) == "TimeoutError: late"

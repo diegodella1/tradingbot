@@ -354,18 +354,25 @@ async function refresh() {
     };
     const btcFresh = Boolean(btc?.fresh);
     const pnl = data.performance?.realized_pnl_usdc || 0;
+    const policyMode = data.policy_mode || data.config?.policy_mode || "unmanaged";
 
     $("#serverStatus").textContent = data.paper_state?.status || "pending";
     $("#serverDot").className = `status-dot ${btcFresh ? "dot-ok pulse-live" : "dot-warn"}`;
     $("#navStatus").textContent = data.paper_state?.status || "sync pending";
-    $("#modeLabel").textContent = data.live_trading_enabled ? "Live Enabled" : "Paper / Locked";
+    $("#modeLabel").textContent = data.live_trading_enabled
+      ? "Live Enabled"
+      : policyMode === "active"
+        ? "Paper · Active policy"
+        : policyMode === "observe"
+          ? "NO TRADE · Observer"
+          : "Paper · Unmanaged";
     const wallet = data.performance?.paper_wallet || {};
     $("#bankrollLabel").textContent = `${fmtUsd(wallet.available_cash_usdc ?? data.config?.paper_bankroll_usdc)} available`;
     $("#btcPrice").textContent = fmtUsd(btc?.price);
     $("#btcFreshDot").className = `status-dot ${btcFresh ? "dot-ok pulse-live" : "dot-warn"}`;
     $("#btcFreshness").innerHTML = btcFresh
       ? `<span class="material-symbols-outlined text-[16px]">check_circle</span> Fresh ${btc.created_at}`
-      : `<span class="material-symbols-outlined text-[16px]">sync_problem</span> Pending/stale feed`;
+      : `<span class="material-symbols-outlined text-[16px]">sync_problem</span> Pending/stale feed · reconnects ${btc?.feed_reconnects || 0}${btc?.feed_task_alive === false ? " · task down" : ""}`;
     $("#totalOrders").textContent = `${data.performance?.total_fills ?? 0} fills`;
     $("#paperVolume").textContent = fmtUsd(data.performance?.paper_volume_usdc || 0);
     $("#paperPnl").textContent = fmtUsd(pnl);

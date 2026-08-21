@@ -6,7 +6,8 @@ import pytest
 
 from bot.btc.price_feed import CoinbaseBtcFeed
 from bot.execution.risk_manager import RiskManager, RiskState
-from bot.main import _sync_risk_state, run_paper_loop
+from bot.learning.versions import activate_candidate, active_policy, register_candidate
+from bot.main import _apply_regime_control, _sync_risk_state, run_paper_loop
 from bot.polymarket.clob import ClobClient
 from bot.polymarket.gamma import GammaClient
 from bot.polymarket.models import BookLevel, BtcMarketState, MarketType, OrderBook
@@ -90,3 +91,61 @@ def test_sync_risk_state_clears_expired_open_exposure(settings):
         assert risk.state.market_exposure == {}
         assert conn.execute("SELECT status FROM positions WHERE market_id = ?", ("expired",)).fetchone()["status"] == "EXPIRED_UNKNOWN"
         assert conn.execute("SELECT COUNT(*) FROM health_events WHERE name = 'risk_state' AND status = 'synced'").fetchone()[0] == 1
+
+
+def test_standard_active_policy_is_evaluated_and_stopped_during_loop(settings):
+    init_db(settings.sqlite_path)
+    evidence = {
+        "test_markets": 30,
+        "trades": 30,
+        "pnl_usdc": 1,
+        "roi": 0.1,
+        "profit_factor": 1.5,
+        "max_drawdown_pct": 0.02,
+        "trades_per_day": 4,
+        "windows": 3,
+        "profitable_windows": 2,
+        "model_validation": {
+            "test_log_loss": 0.5,
+            "market_log_loss": 0.6,
+            "test_brier_score": 0.18,
+            "market_brier_score": 0.22,
+            "beats_market": True,
+        },
+    }
+    with connect(settings.sqlite_path) as conn:
+        register_candidate(
+            conn,
+            "standard-loss",
+            {"market_types": ["15m"]},
+            evidence,
+            evidence_sha256="a" * 64,
+            model_sha256="b" * 64,
+        )
+        activate_candidate(conn, "standard-loss", settings)
+        conn.execute(
+            """
+            INSERT INTO positions (
+              market_id, token_id, size_usdc, avg_price, shares, fee_usdc,
+              status, realized_pnl_usdc, policy_version, break_even_probability,
+              settled_at, updated_at
+            ) VALUES ('loss', 'token', 3, 0.60, 5, 0, 'LOST', -3,
+                      'standard-loss', 0.60, ?, ?)
+            """,
+            (datetime.now(UTC).isoformat(), datetime.now(UTC).isoformat()),
+        )
+        conn.commit()
+        effective = settings.model_copy(update={"policy_version": "standard-loss"})
+        repo = Repository(conn)
+        risk = RiskManager(effective)
+
+        _apply_regime_control(effective, repo, risk, previously_healthy=True)
+
+        assert active_policy(conn) is None
+        assert risk.state.regime_blocked is True
+        assert conn.execute(
+            "SELECT status FROM policy_versions WHERE version='standard-loss'"
+        ).fetchone()["status"] == "stopped"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM health_events WHERE name='paper_policy' AND status='stopped'"
+        ).fetchone()[0] == 1

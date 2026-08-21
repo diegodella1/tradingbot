@@ -47,6 +47,8 @@ class RealtimeMarketData:
         # Feed-degradation tracking (used by the loops to alert on WS -> REST fallback).
         self.rest_fallback_active = False
         self.ever_streamed = False
+        self.consecutive_rest_cycles = 0
+        self.consecutive_stream_cycles = 0
         self._btc_task: asyncio.Task | None = None
         self._chainlink_task: asyncio.Task | None = None
         self._market_ws: MarketWebSocket | None = None
@@ -77,6 +79,10 @@ class RealtimeMarketData:
     @property
     def btc_connected(self) -> bool:
         return bool(self.btc_feed.connected)
+
+    @property
+    def btc_task_alive(self) -> bool:
+        return bool(self._btc_task is not None and not self._btc_task.done())
 
     @property
     def market_connected(self) -> bool:

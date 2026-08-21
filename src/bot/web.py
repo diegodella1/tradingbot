@@ -61,7 +61,7 @@ _settlement_lock = threading.Lock()
 _settlement_running = False
 _last_settlement_completed_at: float | None = None
 _process_started_at = time.monotonic()
-API_SCHEMA_VERSION = 2
+API_SCHEMA_VERSION = 3
 
 
 class DashboardHandler(SimpleHTTPRequestHandler):
@@ -228,6 +228,7 @@ def _build_status_payload() -> dict:
         "generated_at": datetime.now(UTC).isoformat(timespec="seconds"),
         "live_trading_enabled": settings.enable_live_trading,
         "mode": "paper",
+        "policy_mode": settings.policy_mode,
         "config": {
             "paper_bankroll_usdc": settings.paper_bankroll_usdc,
             "paper_trade_size_usdc": settings.paper_trade_size_usdc,
@@ -242,6 +243,7 @@ def _build_status_payload() -> dict:
             "min_orderbook_liquidity_usdc": settings.min_orderbook_liquidity_usdc,
             "kelly_fraction_multiplier": settings.kelly_fraction_multiplier,
             "policy_version": settings.policy_version,
+            "policy_mode": settings.policy_mode,
             "min_break_even_margin_cents": settings.min_break_even_margin_cents,
         },
         "paper_state": _slim_paper_state(latest_state),
@@ -265,15 +267,18 @@ def health_payload() -> dict:
     settings = get_settings()
     state = {"status": "pending"}
     updated_at = None
+    database_ok = False
     if settings.sqlite_path.exists():
         try:
             with closing(_read_connection(settings.sqlite_path)) as conn:
+                settings = apply_active_policy(settings, conn)
                 row = conn.execute(
                     "SELECT value_json, updated_at FROM paper_state WHERE key = 'paper_loop'"
                 ).fetchone()
                 if row:
                     state = json.loads(row["value_json"])
                     updated_at = row["updated_at"]
+                database_ok = True
         except (sqlite3.Error, json.JSONDecodeError):
             state = {"status": "invalid"}
     freshness_seconds = None
@@ -283,24 +288,29 @@ def health_payload() -> dict:
             freshness_seconds = max(0.0, (datetime.now(UTC) - updated).total_seconds())
         except ValueError:
             pass
-    database_ok = settings.sqlite_path.exists()
+    btc = state.get("btc") if isinstance(state.get("btc"), dict) else {}
     return {
         "schema_version": API_SCHEMA_VERSION,
         "ok": database_ok and not settings.enable_live_trading,
         "mode": "paper" if not settings.enable_live_trading else "live",
+        "policy_mode": settings.policy_mode,
         "deploy_commit": settings.deploy_commit,
         "uptime_seconds": round(time.monotonic() - _process_started_at, 3),
         "database_ok": database_ok,
         "paper_loop_status": state.get("status", "pending"),
         "paper_loop_updated_at": updated_at,
         "paper_loop_freshness_seconds": freshness_seconds,
+        "feed_task_alive": bool(btc.get("feed_task_alive")),
+        "btc_age_seconds": btc.get("age_seconds"),
+        "feed_reconnects": int(btc.get("feed_reconnects") or 0),
+        "last_feed_error": btc.get("last_feed_error"),
     }
 
 
 def _slim_paper_state(state: dict) -> dict:
     return {
         key: state.get(key)
-        for key in ("status", "mode", "strategy", "btc")
+        for key in ("status", "mode", "policy_mode", "strategy", "reason", "btc")
         if state.get(key) is not None
     }
 
@@ -657,8 +667,10 @@ def strategies_payload() -> dict:
         strategy_name = "momentum_book_imbalance" if settings.enable_experimental_strategy else "no_trade"
 
     return {
+        "schema_version": API_SCHEMA_VERSION,
         "generated_at": datetime.now(UTC).isoformat(timespec="seconds"),
         "mode": "paper",
+        "policy_mode": settings.policy_mode,
         "live_trading_enabled": settings.enable_live_trading,
         "strategy": {
             "name": strategy_name,
@@ -668,6 +680,7 @@ def strategies_payload() -> dict:
         },
         "config": {
             "enable_experimental_strategy": settings.enable_experimental_strategy,
+            "policy_mode": settings.policy_mode,
             "min_edge_cents": settings.min_edge_cents,
             "min_confidence": settings.min_confidence,
             "min_estimated_probability": settings.min_estimated_probability,
@@ -771,17 +784,44 @@ def _state(conn: sqlite3.Connection, key: str) -> dict:
 
 
 def _latest_btc(conn: sqlite3.Connection, state: dict | None = None) -> dict:
+    state_btc = (state or {}).get("btc") or {}
+    runtime = {
+        key: state_btc.get(key)
+        for key in (
+            "source",
+            "age_seconds",
+            "max_age_seconds",
+            "websocket_connected",
+            "feed_task_alive",
+            "feed_reconnects",
+            "last_feed_error",
+        )
+        if key in state_btc
+    }
+    state_price = state_btc.get("current_price")
+    state_created_at = state_btc.get("price_timestamp")
+    if state_price is not None and state_created_at:
+        created = datetime.fromisoformat(str(state_created_at).replace("Z", "+00:00"))
+        age_seconds = max(0.0, (datetime.now(UTC) - created).total_seconds())
+        max_age_seconds = float(state_btc.get("max_age_seconds") or 10.0)
+        return runtime | {
+            "price": state_price,
+            "created_at": state_created_at,
+            "age_seconds": age_seconds,
+            "fresh": age_seconds <= max_age_seconds,
+        }
     row = conn.execute("SELECT price, created_at FROM btc_ticks ORDER BY created_at DESC LIMIT 1").fetchone()
     if not row:
-        state_btc = (state or {}).get("btc") or {}
-        price = state_btc.get("current_price")
-        created_at = state_btc.get("price_timestamp")
-        if price is None or not created_at:
-            return {"price": None, "created_at": None, "fresh": False}
-        created = datetime.fromisoformat(str(created_at).replace("Z", "+00:00"))
-        return {"price": price, "created_at": created_at, "fresh": (datetime.now(UTC) - created).total_seconds() < 30}
+        return runtime | {"price": None, "created_at": None, "fresh": False}
     created = datetime.fromisoformat(row["created_at"])
-    return {"price": row["price"], "created_at": row["created_at"], "fresh": (datetime.now(UTC) - created).total_seconds() < 30}
+    age_seconds = max(0.0, (datetime.now(UTC) - created).total_seconds())
+    max_age_seconds = float(state_btc.get("max_age_seconds") or 10.0)
+    return runtime | {
+        "price": row["price"],
+        "created_at": row["created_at"],
+        "age_seconds": age_seconds,
+        "fresh": age_seconds <= max_age_seconds,
+    }
 
 
 def _btc_candles_1m(conn: sqlite3.Connection, limit: int = 60) -> list[dict]:
@@ -861,6 +901,7 @@ def _slim_signal(signal: dict | None) -> dict | None:
         "market_type",
         "estimated_probability",
         "probability_source",
+        "model_sha256",
         "min_probability",
         "market_price",
         "edge",
@@ -1110,7 +1151,11 @@ def _execution_stats(conn: sqlite3.Connection) -> dict:
                 "source": btc_state.get("source", "unknown"),
                 "age_seconds": btc_state.get("age_seconds"),
                 "websocket_connected": bool(btc_state.get("websocket_connected")),
-                "fresh": isinstance(btc_state.get("age_seconds"), (int, float)) and float(btc_state["age_seconds"]) <= 5.0,
+                "feed_task_alive": bool(btc_state.get("feed_task_alive")),
+                "feed_reconnects": int(btc_state.get("feed_reconnects") or 0),
+                "last_feed_error": btc_state.get("last_feed_error"),
+                "fresh": isinstance(btc_state.get("age_seconds"), (int, float))
+                and float(btc_state["age_seconds"]) <= float(btc_state.get("max_age_seconds") or 10.0),
             },
             "books": {"sources": book_sources, "fresh": all(bool(item.get("book_fresh")) for item in markets_state if item.get("status") == "ok")},
         },

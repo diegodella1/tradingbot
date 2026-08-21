@@ -9,14 +9,14 @@ from pathlib import Path
 
 import structlog
 
-from bot.btc.price_feed import CoinbaseBtcFeed
+from bot.btc.price_feed import CoinbaseBtcFeed, exception_detail
 from bot.config import Settings
 from bot.execution.order_manager import OrderManager
 from bot.execution.paper_broker import PaperBroker
 from bot.execution.risk_manager import RiskManager
 from bot.monitoring.alerts import send_alert
 from bot.monitoring.regime import regime_snapshot
-from bot.learning.versions import evaluate_and_transition
+from bot.learning.versions import apply_active_policy, evaluate_and_transition
 from bot.polymarket.clob import ClobClient
 from bot.polymarket.gamma import GammaClient, rejection_reason
 from bot.polymarket.models import BtcMarketState, MarketContext, OutcomeSide, SignalAction
@@ -30,6 +30,11 @@ from bot.util.filelock import FileLock, LockAlreadyHeld
 
 def configure_logging() -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
+    # httpx logs every request at INFO. The paper loop performs several API
+    # calls per cycle, so those transport logs drown out trading events and
+    # make journald grow continuously.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     structlog.configure(
         processors=[structlog.processors.TimeStamper(fmt="iso"), structlog.processors.JSONRenderer()],
         wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
@@ -71,7 +76,12 @@ async def run_paper_loop(settings: Settings, max_cycles: int | None = None) -> N
     btc_feed = CoinbaseBtcFeed(settings)
     broker = PaperBroker(settings)
     risk = RiskManager(settings)
-    strategy = MomentumBookImbalanceStrategy(settings) if settings.enable_experimental_strategy else NoTradeStrategy()
+    observer_only = settings.policy_mode == "observe"
+    strategy = (
+        MomentumBookImbalanceStrategy(settings, observer_only=observer_only)
+        if settings.enable_experimental_strategy or observer_only
+        else NoTradeStrategy()
+    )
     realtime = RealtimeMarketData(settings, btc_feed) if settings.enable_websocket_feeds else None
     stop = asyncio.Event()
 
@@ -88,7 +98,7 @@ async def run_paper_loop(settings: Settings, max_cycles: int | None = None) -> N
         with suppress(Exception):
             await realtime.start()
     with connect(settings.sqlite_path) as conn:
-        repo = Repository(conn)
+        repo = Repository(conn, raw_sample_seconds=settings.telemetry_sample_seconds)
         broker.hydrate_orders(repo.open_maker_orders())
         risk.state = repo.hydrate_risk_state(settings.loss_streak_window_minutes)
         try:
@@ -105,6 +115,9 @@ async def run_paper_loop(settings: Settings, max_cycles: int | None = None) -> N
             if realtime is not None:
                 with suppress(Exception):
                     await realtime.stop()
+            else:
+                with suppress(Exception):
+                    await btc_feed.stop()
             with suppress(Exception):
                 await asyncio.wait_for(gamma.close(), timeout=2)
             with suppress(Exception):
@@ -142,15 +155,28 @@ def _acquire_paper_loop_lock(sqlite_path: Path) -> FileLock:
 async def _paper_cycle(settings: Settings, gamma, clob, btc_feed, broker, risk, strategy, repo: Repository, log, realtime: RealtimeMarketData | None = None) -> None:
     _expire_or_cancel_stale_maker_orders(settings, broker, repo)
     _sync_risk_state(settings, repo, risk)
+    effective_settings = apply_active_policy(settings, repo.conn)
+    if effective_settings.policy_mode == "observe" and settings.policy_mode != "observe":
+        settings = effective_settings
+        strategy = MomentumBookImbalanceStrategy(settings, observer_only=True)
     try:
         btc_state, btc_source = await _btc_state_for_cycle(settings, btc_feed, realtime)
         _track_feed_degradation(settings, repo, realtime, using_rest=btc_source == "rest")
         if btc_state.current_price is not None:
             repo.save_btc_tick(btc_state.current_price)
     except Exception as exc:
-        repo.save_health_event("btc_feed", "blocked", str(exc))
-        repo.set_state("paper_loop", {"status": "blocked", "reason": f"btc_feed: {exc}"})
-        log.warning("paper_btc_feed_failed", error=str(exc))
+        detail = exception_detail(exc)
+        repo.save_health_event("btc_feed", "blocked", detail)
+        repo.set_state(
+            "paper_loop",
+            {
+                "status": "blocked",
+                "policy_mode": settings.policy_mode,
+                "reason": f"btc_feed: {detail}",
+                "btc": _btc_runtime_payload(settings, btc_feed.state, "unavailable", btc_feed, realtime),
+            },
+        )
+        log.warning("paper_btc_feed_failed", error=detail)
         return
 
     try:
@@ -163,7 +189,15 @@ async def _paper_cycle(settings: Settings, gamma, clob, btc_feed, broker, risk, 
                     repo.save_discovery_rejection(market_type, str(item.get("question") or item.get("title") or ""), str(item.get("slug") or ""), reason)
     except Exception as exc:
         repo.save_health_event("market_discovery", "blocked", str(exc))
-        repo.set_state("paper_loop", {"status": "blocked", "reason": f"market_discovery: {exc}"})
+        repo.set_state(
+            "paper_loop",
+            {
+                "status": "blocked",
+                "policy_mode": settings.policy_mode,
+                "reason": f"market_discovery: {exc}",
+                "btc": _btc_runtime_payload(settings, btc_state, btc_source, btc_feed, realtime),
+            },
+        )
         log.warning("paper_discovery_failed", error=str(exc))
         return
 
@@ -218,10 +252,11 @@ async def _paper_cycle(settings: Settings, gamma, clob, btc_feed, broker, risk, 
             else:
                 repo.save_order(order)
         _maybe_exit_position(settings, market, context, strategy, broker, risk, repo, log)
-        repo.save_learning_note(
-            f"{market_type.value} {signal.action.value}: {decision.reason}; signal={signal.reason}",
-            "paper,risk,market-real",
-        )
+        if signal.action != SignalAction.HOLD:
+            repo.save_learning_note(
+                f"{market_type.value} {signal.action.value}: {decision.reason}; signal={signal.reason}",
+                "paper,risk,market-real",
+            )
         state_markets.append(
             {
                 "type": market_type.value,
@@ -243,7 +278,14 @@ async def _paper_cycle(settings: Settings, gamma, clob, btc_feed, broker, risk, 
                 "order": order.model_dump(mode="json") if order else None,
             }
         )
-        log.info("paper_real_market_cycle", market=market.question, signal=signal.model_dump(), risk=decision.reason)
+        log.info(
+            "paper_real_market_cycle",
+            market=market.question,
+            action=signal.action.value,
+            confidence=round(signal.confidence, 4),
+            risk=decision.reason,
+            order_id=order.order_id if order else None,
+        )
 
     repo.save_health_event("paper_loop", "ok" if any_market else "no_market", "real-market paper cycle")
     repo.set_state(
@@ -251,13 +293,9 @@ async def _paper_cycle(settings: Settings, gamma, clob, btc_feed, broker, risk, 
         {
             "status": "ok" if any_market else "no_market",
             "mode": "paper",
+            "policy_mode": settings.policy_mode,
             "strategy": strategy.__class__.__name__,
-            "btc": btc_state.model_dump(mode="json")
-            | {
-                "source": btc_source,
-                "age_seconds": _btc_age_seconds(btc_state),
-                "websocket_connected": bool(realtime and realtime.btc_connected),
-            },
+            "btc": _btc_runtime_payload(settings, btc_state, btc_source, btc_feed, realtime),
             "markets": state_markets,
         },
     )
@@ -318,7 +356,7 @@ async def _btc_state_for_cycle(
     permanent HOLDs. Freshness, not mere presence, selects the data source.
     """
     streamed = btc_feed.state
-    max_age = 3.0 if settings.enable_5m_scout and "5m" in settings.market_types else 5.0
+    max_age = settings.btc_price_max_age_seconds
     if realtime is not None and streamed.current_price is not None and streamed.is_fresh(max_age):
         return streamed, "websocket"
     return await btc_feed.poll_once(), "rest"
@@ -327,6 +365,24 @@ def _btc_age_seconds(state: BtcMarketState) -> float | None:
     if state.price_timestamp is None:
         return None
     return max(0.0, (datetime.now(UTC) - state.price_timestamp).total_seconds())
+
+
+def _btc_runtime_payload(
+    settings: Settings,
+    state: BtcMarketState,
+    source: str,
+    btc_feed: CoinbaseBtcFeed,
+    realtime: RealtimeMarketData | None,
+) -> dict:
+    return state.model_dump(mode="json") | {
+        "source": source,
+        "age_seconds": _btc_age_seconds(state),
+        "max_age_seconds": settings.btc_price_max_age_seconds,
+        "websocket_connected": bool(realtime and realtime.btc_connected),
+        "feed_task_alive": bool(realtime and realtime.btc_task_alive),
+        "feed_reconnects": btc_feed.reconnect_count,
+        "last_feed_error": btc_feed.last_error,
+    }
 
 
 def _track_feed_degradation(settings: Settings, repo: Repository, realtime: RealtimeMarketData | None, using_rest: bool) -> None:
@@ -340,12 +396,18 @@ def _track_feed_degradation(settings: Settings, repo: Repository, realtime: Real
         return
     if not using_rest:
         realtime.ever_streamed = True
-        if realtime.rest_fallback_active:
+        realtime.consecutive_rest_cycles = 0
+        realtime.consecutive_stream_cycles += 1
+        if realtime.rest_fallback_active and realtime.consecutive_stream_cycles >= settings.feed_failure_threshold:
             realtime.rest_fallback_active = False
             repo.save_health_event("btc_feed", "recovered", "websocket stream restored")
             send_alert(settings, "btc_feed_recovered", source="websocket")
         return
-    if realtime.ever_streamed and not realtime.rest_fallback_active:
+    realtime.consecutive_stream_cycles = 0
+    if not realtime.ever_streamed:
+        return
+    realtime.consecutive_rest_cycles += 1
+    if not realtime.rest_fallback_active and realtime.consecutive_rest_cycles >= settings.feed_failure_threshold:
         realtime.rest_fallback_active = True
         repo.save_health_event("btc_feed", "degraded", "websocket down; polling REST fallback")
         send_alert(settings, "btc_feed_degraded", fallback="rest", websocket_connected=realtime.connected)
@@ -421,22 +483,24 @@ def _apply_regime_control(settings: Settings, repo: Repository, risk: RiskManage
         settings.regime_min_trades,
         policy_version=settings.policy_version,
     )
-    experiment_stopped = False
-    if settings.paper_experiment_enabled:
-        active = repo.conn.execute(
-            "SELECT is_active FROM policy_versions WHERE version = ?",
-            (settings.policy_version,),
-        ).fetchone()
-        if not active or not bool(active["is_active"]):
-            experiment_stopped = True
-        else:
-            decision = evaluate_and_transition(repo.conn, settings.policy_version, settings)
-            experiment_stopped = decision.status == "stopped"
-            if experiment_stopped:
-                repo.save_health_event("paper_experiment", "stopped", decision.reason)
-                send_alert(settings, "paper_experiment_stopped", policy_version=settings.policy_version, reason=decision.reason)
+    policy_inactive = False
+    active = repo.conn.execute(
+        "SELECT version FROM policy_versions WHERE is_active = 1 LIMIT 1"
+    ).fetchone()
+    if active is not None and active["version"] == settings.policy_version:
+        decision = evaluate_and_transition(repo.conn, settings.policy_version, settings)
+        policy_inactive = decision.status in {"stopped", "rejected"}
+        if policy_inactive:
+            repo.save_health_event("paper_policy", decision.status, decision.reason)
+            send_alert(
+                settings,
+                "paper_policy_inactive",
+                policy_version=settings.policy_version,
+                status=decision.status,
+                reason=decision.reason,
+            )
     risk.state.regime_healthy = bool(snapshot["healthy"])
-    risk.state.regime_blocked = experiment_stopped or (settings.enable_regime_stop and not snapshot["healthy"])
+    risk.state.regime_blocked = policy_inactive or (settings.enable_regime_stop and not snapshot["healthy"])
     if not snapshot["evaluated"]:
         return
     detail = (

@@ -14,6 +14,8 @@ bot.sqlite3-*
 probability_model.json
 probability_model.candidate.json
 probability_model.rejected.json
+probability_model.previous.json
+.probability_model.json.next
 logs/
 artifacts/*
 !artifacts/policy-evidence/

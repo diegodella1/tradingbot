@@ -12,13 +12,36 @@ from bot.storage.db import connect, init_db
 from bot import web
 
 
+def _evidence(*, pnl_usdc: float = 2.0, roi: float = 0.08) -> dict:
+    return {
+        "method": "chronological_market_split_80_20_full_gates",
+        "test_markets": 30,
+        "trades": 50,
+        "pnl_usdc": pnl_usdc,
+        "roi": roi,
+        "profit_factor": 1.5,
+        "max_drawdown_pct": 0.02,
+        "trades_per_day": 4.0,
+        "windows": 5,
+        "profitable_windows": 4,
+        "model_validation": {
+            "test_log_loss": 0.50,
+            "market_log_loss": 0.60,
+            "test_brier_score": 0.18,
+            "market_brier_score": 0.22,
+            "beats_market": True,
+        },
+    }
+
+
 def _activate(conn, settings, version: str = "v-evolution") -> None:
     register_candidate(
         conn,
         version,
         {"market_types": ["15m"], "min_entry_price_15m": 0.55},
-        {"trades": 50, "pnl_usdc": 2.0, "roi": 0.08, "windows": 5, "profitable_windows": 4},
+        _evidence(),
         evidence_sha256="e" * 64,
+        model_sha256="f" * 64,
     )
     assert activate_candidate(conn, version, settings).status == "paper_active"
 
@@ -127,22 +150,25 @@ def test_policy_backfill_migration_is_idempotent(settings):
 
 
 def test_experiment_cannot_be_auto_superseded_before_fifty_settlements(settings):
+    settings = settings.model_copy(update={"paper_auto_promote": True})
     init_db(settings.sqlite_path)
     with connect(settings.sqlite_path) as conn:
         register_candidate(
             conn,
             "v5-champion",
             {"paper_order_style": "maker", "paper_experiment_enabled": True},
-            {"trades": 20, "pnl_usdc": 1, "roi": 0.1, "windows": 3, "profitable_windows": 2},
+            _evidence(pnl_usdc=1, roi=0.1),
             evidence_sha256="a" * 64,
+            model_sha256="f" * 64,
         )
         assert activate_paper_experiment(conn, "v5-champion", settings).status == "paper_active"
         register_candidate(
             conn,
             "v6-candidate",
             {"market_types": ["15m"]},
-            {"trades": 50, "pnl_usdc": 2, "roi": 0.1, "windows": 5, "profitable_windows": 4},
+            _evidence(roi=0.1),
             evidence_sha256="b" * 64,
+            model_sha256="f" * 64,
         )
 
         decision = auto_promote_best_candidate(conn, settings)

@@ -10,7 +10,6 @@ MODEL_ACTIVE="${MODEL_ACTIVE:-$ROOT_DIR/probability_model.json}"
 MODEL_CANDIDATE="${MODEL_CANDIDATE:-$ROOT_DIR/probability_model.candidate.json}"
 MODEL_REJECTED="${MODEL_REJECTED:-$ROOT_DIR/probability_model.rejected.json}"
 PROMOTE_MODEL="${PROMOTE_MODEL:-false}"
-MIN_POLICY_SETTLEMENTS="${MIN_POLICY_SETTLEMENTS:-50}"
 RESTART_PAPER_ON_PROMOTE="${RESTART_PAPER_ON_PROMOTE:-true}"
 
 mkdir -p "$LOG_DIR"
@@ -24,7 +23,6 @@ echo "root=$ROOT_DIR"
 echo "python=$PYTHON_BIN"
 echo "promote_model=$PROMOTE_MODEL"
 echo "restart_paper_on_promote=$RESTART_PAPER_ON_PROMOTE"
-echo "min_policy_settlements=$MIN_POLICY_SETTLEMENTS"
 
 if [ ! -x "$PYTHON_BIN" ]; then
   echo "ERROR python_not_found=$PYTHON_BIN"
@@ -59,20 +57,18 @@ if [ ! -f "$MODEL_CANDIDATE" ]; then
   exit 1
 fi
 
+PYTHONPATH="$ROOT_DIR/src" "$PYTHON_BIN" -c \
+  'import sys; from bot.strategy.calibration import ProbabilityModel; model=ProbabilityModel.load(sys.argv[1]); raise SystemExit(0 if model and model.is_trade_approved() else 1)' \
+  "$MODEL_CANDIDATE" || {
+    mv "$MODEL_CANDIDATE" "$MODEL_REJECTED"
+    echo "model_decision=rejected reason=model_contract_not_approved"
+    exit 0
+  }
+
 if [ "$PROMOTE_MODEL" = "true" ]; then
-  "$PYTHON_BIN" -m bot.cli learning-promotion-check \
-    --min-policy-settlements "$MIN_POLICY_SETTLEMENTS"
-  STAGED_MODEL="$MODEL_ACTIVE.next.$$"
-  cp "$MODEL_CANDIDATE" "$STAGED_MODEL"
   CANDIDATE_SHA256="$(sha256sum "$MODEL_CANDIDATE" | awk '{print $1}')"
-  STAGED_SHA256="$(sha256sum "$STAGED_MODEL" | awk '{print $1}')"
-  if [ "$CANDIDATE_SHA256" != "$STAGED_SHA256" ]; then
-    rm -f "$STAGED_MODEL"
-    echo "model_decision=rejected reason=checksum_mismatch"
-    exit 1
-  fi
-  mv -f "$STAGED_MODEL" "$MODEL_ACTIVE"
-  "$PYTHON_BIN" -m bot.cli learning-model-promoted --sha256 "$CANDIDATE_SHA256"
+  PROBABILITY_MODEL_PATH="$MODEL_ACTIVE" "$PYTHON_BIN" -m bot.cli \
+    model-promote --candidate-model "$MODEL_CANDIDATE"
   echo "model_decision=promoted active_model=$MODEL_ACTIVE sha256=$CANDIDATE_SHA256"
   if [ "$RESTART_PAPER_ON_PROMOTE" = "true" ]; then
     /bin/bash "$ROOT_DIR/scripts/restart_paper.sh"

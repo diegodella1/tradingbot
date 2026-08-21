@@ -96,11 +96,14 @@ python -m bot.cli policy-register \
   --version btc-updown-v4 \
   --config-json '{"market_types":["15m"]}' \
   --evidence-file ./oos-v4.json \
-  --model-file ./probability_model.candidate.json
+  --model-file ./probability_model.json \
+  --activate
 python -m bot.cli policy-status --evaluate
 ```
 
-Backtest recorded signals, with out-of-sample gate sweep (model trained on the first 80% of markets, gates evaluated on the held-out 20%):
+Backtest recorded signals with market-disjoint validation: the policy model is
+trained on the first 60% of markets, gates are selected on the next 20%, and the
+chosen gates must pass once on the untouched final 20%:
 
 ```bash
 python -m bot.cli backtest --buckets --sweep
@@ -115,7 +118,22 @@ python -m bot.cli policy-optimize --version btc-updown-v4-oos-15m
 python -m bot.cli policy-optimize --version btc-updown-v4-oos-15m --register
 ```
 
-Train the calibrated probability model:
+The optimizer writes the exact train-split model next to the evidence. While
+the registry is in `NO TRADE`, promote that artifact, restart paper, then rerun
+with both `--register --activate`. If a predecessor is still active, stop it
+explicitly first with `policy-stop`. Activation fails if the runtime model hash
+or predecessor maturity does not match:
+
+```bash
+python -m bot.cli model-promote \
+  --candidate-model artifacts/policy-evidence/btc-updown-v4-oos-15m.model.json
+sudo systemctl restart tradingbot-paper.service
+python -m bot.cli policy-optimize --version btc-updown-v4-oos-15m --register --activate
+```
+
+Train a diagnostic candidate model. It is never written over the active model
+by default, and remains ineligible unless it beats the market on both log-loss
+and Brier score across at least 30 held-out markets:
 
 ```bash
 python -m bot.cli calibrate
@@ -127,12 +145,11 @@ Run the guarded learning cycle without changing the active model (default):
 bash scripts/learning_cycle.sh
 ```
 
-Model promotion is explicit and blocked until the active experiment has 50
-verified settlements. A successful promotion is written to the evolution
-ledger:
+Model promotion is explicit and allowed only while there is no active policy;
+the exact artifact and checksum are written to the evolution ledger:
 
 ```bash
-PROMOTE_MODEL=true MIN_POLICY_SETTLEMENTS=50 bash scripts/learning_cycle.sh
+PROMOTE_MODEL=true bash scripts/learning_cycle.sh
 ```
 
 Refetch closed markets without a verified winner (also runs automatically inside the paper loop every `OUTCOME_BACKFILL_CYCLES`):
@@ -141,7 +158,10 @@ Refetch closed markets without a verified winner (also runs automatically inside
 python -m bot.cli backfill-outcomes
 ```
 
-Delete market snapshots and BTC ticks older than `DATA_RETENTION_DAYS` (also runs automatically once per day inside the paper loop):
+Prune raw snapshots/ticks and repetitive old HOLD, risk, health, and learning
+telemetry older than `DATA_RETENTION_DAYS` (also runs automatically once per
+day). Actionable BUY decisions, orders, fills, positions, policies, and evolution
+evidence are retained:
 
 ```bash
 python -m bot.cli prune --vacuum
@@ -163,12 +183,14 @@ python -m bot.cli maker-sim \
   --min-net-edge-cents 2.5
 ```
 
-The guarded v5 experiment keeps `$0.25` paper sizing, posts one cent below the
-best bid, and requires 2.5 cents of net edge. Its activation script refuses to
-supersede v4 until v4 has 20 settled fills or has stopped:
+Legacy v4/v5 evidence remains in the ledger, but those experiments cannot be
+reactivated under the new challenger contract. New challengers need at least
+30 OOS trades, 30 held-out markets, PF >= 1.25, drawdown <= 3%, 2-6 entries/day,
+a majority of profitable windows, and an approved model checksum. A predecessor
+must have 50 paper settlements or be terminal before a successor can start:
 
 ```bash
-PYTHONPATH=src python scripts/activate_margin_maker_experiment.py
+python -m bot.cli policy-status
 ```
 
 ## Public paper dashboard
@@ -180,7 +202,7 @@ timeline. `GET /api/evolution` returns per-settlement win rate, break-even,
 PnL, drawdown, policy eras and lifecycle milestones. Reconstructed historical
 events are labeled separately from events recorded by the live ledger.
 
-`GET /api/healthz` provides a lightweight paper-loop, database and deployed-commit check for service monitoring.
+`GET /api/healthz` provides a lightweight paper-loop, database and deployed-commit check for service monitoring. API schema v3 also exposes `policy_mode`, `feed_task_alive`, `btc_age_seconds`, `feed_reconnects`, and `last_feed_error`.
 
 Check wallet readiness without placing live orders:
 
@@ -200,13 +222,16 @@ The live broker adapter can create/post guarded limit orders through the SDK, bu
 
 - Paper uses real Polymarket/Gamma/CLOB and BTC data.
 - Paper does not use mock markets outside tests.
-- Default paper bankroll is `$100`.
+- Default paper bankroll is `$10`.
 - Default paper trade size is `$1`.
 - Paper mode estimates Polymarket crypto taker fees using the documented formula `shares * fee_rate * price * (1 - price)` with `PAPER_TAKER_FEE_RATE=0.07`.
 - Maximum open markets is `1`.
 - Filled positions are held to resolution; the bot does not simulate early exits by default.
 - If no real verified BTC Up/Down 5m/15m market is available, the bot records `no_market` and does not simulate a trade.
 - Learning recommendations are report-only. They use settled paper outcomes, fees, price buckets, timeframe results, and RAG snippets to suggest safer config changes, but they never auto-change bot parameters.
+- A losing active policy enters fail-closed `NO TRADE`: open maker orders are canceled, no prior loser is restored automatically, and the strategy keeps observer-only feature collection.
+- Policy auto-promotion defaults off; activation requires an explicit CLI action after every challenger gate passes.
+- Legacy/unapproved probability models are diagnostic-only and cannot authorize an entry.
 
 ## Kill Switch
 
@@ -253,14 +278,20 @@ Only restore a full SQLite backup after stopping both `tradingbot-paper.service`
 
 ### Commit-pinned production
 
-Production releases are immutable Git archives selected by commit SHA. Install the systemd drop-ins once, then deploy a clean commit already published to `origin/main`:
+Production releases are immutable Git archives selected by commit SHA. `uv.lock`
+pins dependencies; each release builds its own `.venv`, is source-verified, and
+is made read-only. Runtime data and the model remain outside the release. Deploy
+a clean commit already published to `origin/main`:
 
 ```bash
 ./scripts/install_release_units.sh
 ./scripts/deploy_release.sh <commit-sha>
 ```
 
-Deployment runs tests, switches the `current` symlink atomically, restarts both services and verifies `/api/healthz`. A failed health check restores the prior release.
+Deployment verifies the lock, runs tests, installs the release unit contract,
+switches `current` plus `current.env` atomically, restarts both services, and
+verifies `/api/healthz` against the expected commit. A failed health check
+restores the prior release and runtime environment.
 
 Database compaction is offline and rollback-safe. It checks integrity, creates a checksummed backup, aggregates repeated telemetry, compacts a copied database, swaps it only after validation, then checks service health:
 
@@ -279,16 +310,16 @@ Official Polymarket docs referenced:
 
 ## Known Limitations
 
-- Paper mode currently runs one cycle, useful for safe validation and cron-style iteration.
 - WebSocket user channel reconciliation is scaffolded but not fully integrated.
-- Long-running live loop orchestration is intentionally minimal; review it before unattended live use.
+- Live orchestration remains intentionally disabled pending authenticated reconciliation and an exchange watchdog.
 - Market discovery depends on public API field names and rejects ambiguous mappings.
 - No strategy has been validated for profitability.
+- A challenger needs at least 30 held-out markets and 30 OOS trades, so observer collection can take time.
 
 ## Suggested Next Steps
 
-- Add long-running supervisor loop with graceful shutdown.
-- Persist market snapshots and BTC ticks during paper mode.
+- Collect observer evidence until the nested chronological validation gates have enough independent markets.
+- Calibrate and promote an approved model explicitly; activate a policy only when its exact model checksum matches production.
 - Integrate authenticated user WebSocket for live reconciliation.
 - Add exchange heartbeat/cancel-all watchdog before enabling live posting.
-- Backtest experimental strategy before any live use.
+- Monitor feed reconnects, BTC freshness, database growth, and policy lifecycle events from `/api/healthz` and `/api/evolution`.

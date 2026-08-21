@@ -45,3 +45,16 @@ def test_actionable_signals_are_never_coalesced(settings, market):
         repo.save_signal(market.market_id, signal)
 
         assert conn.execute("SELECT COUNT(*) FROM signals").fetchone()[0] == 2
+
+
+def test_raw_telemetry_is_sampled_per_token_and_feed(settings, book):
+    init_db(settings.sqlite_path)
+    with connect(settings.sqlite_path) as conn:
+        repo = Repository(conn, raw_sample_seconds=15)
+        repo.save_snapshot(book)
+        repo.save_snapshot(book)
+        repo.save_btc_tick(60_000)
+        repo.save_btc_tick(60_001)
+
+        assert conn.execute("SELECT COUNT(*) FROM market_snapshots").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM btc_ticks").fetchone()[0] == 1

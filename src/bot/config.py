@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     enable_live_trading: bool = False
     enable_experimental_strategy: bool = False
     require_live_confirmation: bool = True
+    policy_mode: Literal["unmanaged", "active", "observe"] = "unmanaged"
 
     max_position_usdc: float = 5.0
     max_market_position_usdc: float = 5.0
@@ -45,6 +46,9 @@ class Settings(BaseSettings):
     price_feed: Literal["coinbase"] = "coinbase"
     enable_websocket_feeds: bool = False
     websocket_book_max_age_seconds: float = 5.0
+    btc_price_max_age_seconds: float = Field(default=10.0, gt=0)
+    feed_failure_threshold: int = Field(default=3, ge=1)
+    feed_reconnect_max_seconds: float = Field(default=30.0, ge=1.0)
     btc_symbol: str = "BTC-USD"
     market_types: Annotated[list[str], NoDecode] = Field(default_factory=lambda: ["5m", "15m"])
     kill_switch_file: Path = Path("./KILL_SWITCH")
@@ -67,6 +71,7 @@ class Settings(BaseSettings):
     dashboard_admin_token: str = ""
     deploy_commit: str = "unknown"
     data_retention_days: int = 7
+    telemetry_sample_seconds: int = Field(default=15, ge=1)
     outcome_backfill_cycles: int = 60
     regime_window_trades: int = 50
     regime_min_trades: int = 30
@@ -74,7 +79,7 @@ class Settings(BaseSettings):
     paper_experiment_enabled: bool = False
     paper_experiment_stop_loss_usdc: float = 1.0
     paper_experiment_max_drawdown_pct: float = 0.01
-    paper_experiment_min_fills: int = 20
+    paper_experiment_min_fills: int = 50
     paper_experiment_min_profit_factor: float = 1.10
     paper_experiment_min_fill_rate: float = 0.50
     live_order_style: Literal["taker", "maker"] = "taker"
@@ -132,12 +137,17 @@ class Settings(BaseSettings):
     cancel_unfilled_after_seconds: int = 20
     enable_learning_recommendations: bool = True
     policy_version: str = "btc-updown-v3-break-even"
+    policy_model_sha256: str | None = None
     min_break_even_margin_cents: float = 0.0
-    paper_auto_promote: bool = True
+    paper_auto_promote: bool = False
     policy_min_forward_trades: int = 200
     policy_min_profit_factor: float = 1.10
     policy_max_drawdown_pct: float = 0.15
+    policy_interim_min_trades: int = Field(default=30, ge=1)
+    policy_interim_stop_loss_usdc: float = Field(default=3.0, gt=0)
+    policy_interim_max_drawdown_pct: float = Field(default=0.03, gt=0, le=1)
     policy_require_evidence_hash: bool = True
+    require_approved_probability_model: bool = True
     rag_paths: Annotated[list[Path], NoDecode] = Field(default_factory=lambda: [Path("./README.md"), Path("./docs")])
     rag_obsidian_vault_path: Path | None = None
     polymarket_signature_type: int = 3
@@ -247,6 +257,7 @@ class Settings(BaseSettings):
         """Safe, non-secret config snapshot stored with new paper decisions."""
         keys = (
             "policy_version",
+            "policy_model_sha256",
             "enable_experimental_strategy",
             "enable_5m_scout",
             "min_confidence",

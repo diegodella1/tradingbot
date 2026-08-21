@@ -8,6 +8,7 @@ BACKUP_DIR="${BACKUP_DIR:-$ROOT_DIR/backups/maintenance}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 PREVIOUS="$DATABASE.precompact.$STAMP"
 FAILED="$DATABASE.failed.$STAMP"
+RETENTION_DAYS="${DATA_RETENTION_DAYS:-7}"
 
 if [ -e "$OUTPUT" ]; then
   echo "ERROR compact_output_exists=$OUTPUT"
@@ -31,7 +32,8 @@ trap rollback ERR
   'import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); print(c.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone())' \
   "$DATABASE"
 PYTHONPATH="$ROOT_DIR/src" "$ROOT_DIR/.venv/bin/python" \
-  "$ROOT_DIR/scripts/compact_database.py" "$DATABASE" "$OUTPUT" --backup-directory "$BACKUP_DIR"
+  "$ROOT_DIR/scripts/compact_database.py" "$DATABASE" "$OUTPUT" \
+  --backup-directory "$BACKUP_DIR" --retention-days "$RETENTION_DAYS"
 
 mv "$DATABASE" "$PREVIOUS"
 rm -f "$DATABASE-wal" "$DATABASE-shm"

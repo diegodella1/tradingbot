@@ -5,7 +5,7 @@ import json
 
 from bot import web
 from bot.storage.db import force_settle_pending_positions, init_db
-from bot.web import _btc_candles_1m, _execution_stats, analytics_payload, force_settlements_payload, learning_payload, status_payload, strategies_payload
+from bot.web import _btc_candles_1m, _execution_stats, analytics_payload, force_settlements_payload, health_payload, learning_payload, status_payload, strategies_payload
 
 
 def test_status_payload_has_dashboard_contract(settings, monkeypatch):
@@ -15,6 +15,7 @@ def test_status_payload_has_dashboard_contract(settings, monkeypatch):
     payload = status_payload()
 
     assert payload["mode"] == "paper"
+    assert payload["policy_mode"] == "unmanaged"
     assert "btc" in payload
     assert "markets" in payload
     assert "performance" in payload
@@ -25,6 +26,36 @@ def test_status_payload_has_dashboard_contract(settings, monkeypatch):
     assert "feed_health" in payload["execution"]
     assert "rag_documents" in payload["counts"]
     assert any(item["name"] == "live trading" and item["ok"] for item in payload["safety"])
+
+
+def test_health_payload_exposes_policy_and_feed_runtime(settings, monkeypatch):
+    monkeypatch.chdir(settings.sqlite_path.parent)
+    init_db(settings.sqlite_path)
+    now = datetime.now(UTC).isoformat()
+    state = {
+        "status": "ok",
+        "policy_mode": "observe",
+        "btc": {
+            "age_seconds": 2.5,
+            "feed_task_alive": True,
+            "feed_reconnects": 4,
+            "last_feed_error": "ConnectionError: reset",
+        },
+    }
+    with __import__("sqlite3").connect(settings.sqlite_path) as conn:
+        conn.execute(
+            "INSERT INTO paper_state (key, value_json, updated_at) VALUES (?, ?, ?)",
+            ("paper_loop", json.dumps(state), now),
+        )
+
+    payload = health_payload()
+
+    assert payload["schema_version"] == 3
+    assert payload["policy_mode"] == "unmanaged"
+    assert payload["feed_task_alive"] is True
+    assert payload["btc_age_seconds"] == 2.5
+    assert payload["feed_reconnects"] == 4
+    assert payload["last_feed_error"] == "ConnectionError: reset"
 
 
 def test_gate_failure_share_uses_only_decisions_with_gate_telemetry(settings):

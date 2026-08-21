@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import shutil
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
@@ -15,18 +16,19 @@ from bot.backtest import (
     load_samples,
     policy_config,
     policy_evidence,
-    recommend,
-    recommend_policy,
     recommended_env_lines,
     run_backtest,
     run_walk_forward_sweep,
+    select_validated_policy,
+    walk_forward_by_market,
 )
 from bot.config import Settings, get_settings
 from bot.knowledge.rag import index_markdown, search
 from bot.learning.evolution import record_evolution_event
-from bot.strategy.calibration import accuracy, fit_logistic, log_loss, walk_forward
+from bot.strategy.calibration import ProbabilityModel, accuracy, fit_logistic, log_loss
 from bot.learning.policy import generate_learning_report, persist_learning_recommendations
 from bot.learning.versions import (
+    activate_candidate,
     activate_paper_experiment,
     active_policy,
     apply_active_policy,
@@ -36,6 +38,7 @@ from bot.learning.versions import (
     list_policies,
     register_candidate,
     rollback_paper_experiment,
+    stop_active_policy,
 )
 from bot.live_loop import run_live_loop
 from bot.main import configure_logging, run_paper_loop
@@ -56,6 +59,37 @@ def _settings() -> Settings:
     settings = get_settings()
     init_db(settings.sqlite_path)
     return settings
+
+
+def _stamp_model_contract(model: ProbabilityModel, rows, report: dict) -> ProbabilityModel:
+    """Bind a model artifact to its exact training data and held-out metrics."""
+    ordered = sorted(rows, key=lambda row: row.epoch)
+    dataset_payload = [
+        [row.market_id, row.side, row.created_at, row.label, *row.features]
+        for row in ordered
+    ]
+    dataset_sha256 = hashlib.sha256(
+        json.dumps(dataset_payload, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    ).hexdigest()
+    approved = bool(report["beats_market"] and report["test_markets"] >= 30)
+    model.schema_version = 2
+    model.training_metadata = {
+        "data_start": ordered[0].created_at,
+        "data_end": ordered[-1].created_at,
+        "distinct_markets": len({row.market_id for row in ordered}),
+        "dataset_sha256": dataset_sha256,
+        "oos": {
+            "test_markets": report["test_markets"],
+            "test_rows": report["test_rows"],
+            "test_log_loss": report["test_log_loss"],
+            "market_log_loss": report["market_log_loss"],
+            "test_brier_score": report["test_brier_score"],
+            "market_brier_score": report["market_brier_score"],
+            "beats_market": report["beats_market"],
+            "approved": approved,
+        },
+    }
+    return model
 
 
 @app.command()
@@ -185,28 +219,42 @@ def _print_sweep(training_rows, settings: Settings) -> None:
         raise typer.Exit(1) from exc
     typer.echo(
         f"- sweep out-of-sample: modelo entrenado con {report['train_markets']} mercados "
-        f"({report['train_rows']} filas); gates evaluados en {report['test_markets']} mercados de test"
+        f"({report['train_rows']} filas); selección en {report['validation_markets']} mercados y "
+        f"verificación final en {report['test_markets']} mercados"
     )
     train_by_key = {_cell_key(cell): cell for cell in report["train_cells"]}
-    ranked = sorted((cell for cell in report["test_cells"] if cell.trades > 0), key=lambda c: c.pnl_usdc, reverse=True)
-    typer.echo("- top 10 por PnL out-of-sample (IS = in-sample con el mismo modelo):")
+    test_by_key = {_cell_key(cell): cell for cell in report["test_cells"]}
+    ranked = sorted((cell for cell in report["validation_cells"] if cell.trades > 0), key=lambda c: c.pnl_usdc, reverse=True)
+    typer.echo("- top 10 de selección en validación (test final permanece intocable):")
     for cell in ranked[:10]:
         train_cell = train_by_key.get(_cell_key(cell))
+        test_cell = test_by_key.get(_cell_key(cell))
         in_sample = (
             f"IS n={train_cell.trades} WR={_fmt_pct(train_cell.win_rate)} pnl={train_cell.pnl_usdc:+.2f}"
             if train_cell
             else "IS --"
         )
+        final_test = (
+            f"TEST n={test_cell.trades} WR={_fmt_pct(test_cell.win_rate)} pnl={test_cell.pnl_usdc:+.2f}"
+            if test_cell
+            else "TEST --"
+        )
         typer.echo(
             f"  p>={cell.min_probability} sec>={cell.min_seconds_to_close} "
             f"banda={cell.price_band[0]}-{cell.price_band[1]} net>={cell.min_net_edge_cents}c "
-            f"solo15m={cell.only_15m} | OOS n={cell.trades} WR={_fmt_pct(cell.win_rate)} "
-            f"pnl={cell.pnl_usdc:+.2f} freq={cell.trades_per_day:.1f}/d | {in_sample}"
+            f"solo15m={cell.only_15m} | VAL n={cell.trades} WR={_fmt_pct(cell.win_rate)} "
+            f"pnl={cell.pnl_usdc:+.2f} freq={cell.trades_per_day:.1f}/d | {in_sample} | {final_test}"
         )
-    best = recommend_policy(report["test_cells"], min_trades=20)
-    if best is None:
+    validated = select_validated_policy(
+        report,
+        min_trades=30,
+        min_profit_factor=1.25,
+        max_drawdown_pct=0.03,
+    ) if report["beats_market"] and report["test_markets"] >= 30 else None
+    if validated is None:
         typer.echo("- sin recomendacion: ninguna celda 15m cumple PnL/PF/drawdown/ventanas y frecuencia 2-6/d")
         return
+    best = validated.verified_on_test
     typer.echo(
         f"- recomendado por OOS (WR={_fmt_pct(best.win_rate)}, n={best.trades}, "
         f"pnl={best.pnl_usdc:+.2f}, PF={best.profit_factor:.2f}, DD={best.max_drawdown_pct:.1%}, "
@@ -223,11 +271,11 @@ def _cell_key(cell) -> tuple:
 @app.command()
 def calibrate(
     min_samples: int = typer.Option(500, min=1, help="Minimum training rows required to train."),
-    output: str | None = typer.Option(None, help="Where to write the model JSON (defaults to settings path)."),
+    output: str | None = typer.Option(None, help="Where to write the model JSON (defaults to a non-active candidate path)."),
 ) -> None:
     """Train the market-anchored probability model on ALL recorded decisions (both sides).
 
-    Uses walk-forward (chronological 80/20) validation and reports the market
+    Uses a chronological 80/20 split at market boundaries and reports the market
     baseline so overfit models are visible before deploying.
     """
     settings = _settings()
@@ -239,28 +287,50 @@ def calibrate(
 
     rows = [row.features for row in training_rows]
     labels = [row.label for row in training_rows]
-    typer.echo(f"training rows={len(rows)} (markets={len({row.market_id for row in training_rows})}) base_rate={sum(labels) / len(labels):.3f}")
+    markets = {row.market_id for row in training_rows}
+    typer.echo(f"training rows={len(rows)} (markets={len(markets)}) base_rate={sum(labels) / len(labels):.3f}")
 
-    report = walk_forward(rows, labels)
-    typer.echo("walk-forward (80/20 cronologico):")
+    report = walk_forward_by_market(training_rows)
+    typer.echo("walk-forward (80/20 por mercado):")
     typer.echo(
-        f"- train n={report['train_samples']} log_loss={report['train_log_loss']:.4f} | "
-        f"test n={report['test_samples']} log_loss={report['test_log_loss']:.4f} acc={report['test_accuracy']:.3f}"
+        f"- train markets={report['train_markets']} rows={report['train_rows']} | "
+        f"test markets={report['test_markets']} rows={report['test_rows']} "
+        f"log_loss={report['test_log_loss']:.4f} brier={report['test_brier_score']:.4f}"
     )
-    typer.echo(f"- baseline mercado (ask como prob): log_loss={report['market_log_loss']:.4f}")
-    if report["test_log_loss"] >= report["market_log_loss"]:
-        typer.echo("- ADVERTENCIA: el modelo NO supera al mercado out-of-sample; no conviene usarlo para tradear")
-    typer.echo("- WR out-of-sample por cutoff:")
-    for item in report["wr_by_cutoff"]:
-        typer.echo(f"  p>={item['cutoff']:.2f}: n={item['n']} WR={_fmt_pct(item['win_rate'])}")
+    typer.echo(
+        f"- baseline mercado: log_loss={report['market_log_loss']:.4f} "
+        f"brier={report['market_brier_score']:.4f}"
+    )
+    approved = bool(report["beats_market"] and report["test_markets"] >= 30)
 
-    model = fit_logistic(rows, labels)
-    destination = output or str(settings.probability_model_path)
+    model = _stamp_model_contract(fit_logistic(rows, labels), training_rows, report)
+    dataset_sha256 = model.training_metadata["dataset_sha256"]
+    default_candidate = settings.probability_model_path.with_name(
+        f"{settings.probability_model_path.stem}.candidate{settings.probability_model_path.suffix}"
+    )
+    destination = output or str(default_candidate)
     model.save(destination)
     typer.echo(f"- full-data log_loss={log_loss(model, rows, labels):.4f} accuracy={accuracy(model, rows, labels):.3f}")
     typer.echo(f"- weights={[round(w, 3) for w in model.weights]} bias={round(model.bias, 3)}")
-    typer.echo(f"- saved model to {destination}")
-    typer.echo("enable it by keeping ENABLE_EXPERIMENTAL_STRATEGY=true; the strategy loads it automatically")
+    typer.echo(f"- saved diagnostic model to {destination}")
+    if not approved:
+        with connect(settings.sqlite_path) as conn:
+            active = active_policy(conn)
+            record_evolution_event(
+                conn,
+                event_key=f"model:{dataset_sha256}:rejected",
+                policy_version=active["version"] if active else None,
+                event_type="model_rejected",
+                title="Probability model rejected",
+                summary="Candidate failed market-separated calibration gates.",
+                occurred_at=datetime.now(UTC).isoformat(),
+                metrics=model.training_metadata["oos"],
+                reason="model must beat market log-loss and Brier score with at least 30 OOS markets",
+            )
+            conn.commit()
+        typer.echo("- ADVERTENCIA: el modelo NO supera gates OOS; queda diagnostic-only")
+        return
+    typer.echo("- candidate approved for policy evidence; promotion remains explicit")
 
 
 @app.command("maker-sim")
@@ -354,14 +424,14 @@ def prune(
     retention_days: int | None = typer.Option(None, min=1, help="Retention window; defaults to DATA_RETENTION_DAYS."),
     vacuum: bool = typer.Option(False, "--vacuum", help="Run VACUUM afterwards to reclaim disk space (slow, needs free space)."),
 ) -> None:
-    """Delete market snapshots and BTC ticks older than the retention window."""
+    """Prune old raw and repetitive decision telemetry while preserving trades."""
     settings = _settings()
     days = retention_days if retention_days is not None else settings.data_retention_days
     with connect(settings.sqlite_path) as conn:
         result = prune_old_data(conn, days)
     typer.echo(f"prune (retention={days}d, cutoff={result['cutoff']})")
-    typer.echo(f"- market_snapshots deleted={result['market_snapshots_deleted']}")
-    typer.echo(f"- btc_ticks deleted={result['btc_ticks_deleted']}")
+    for key in sorted(item for item in result if item.endswith("_deleted")):
+        typer.echo(f"- {key.removesuffix('_deleted')} deleted={result[key]}")
     if vacuum:
         with connect(settings.sqlite_path) as conn:
             conn.execute("VACUUM")
@@ -498,23 +568,32 @@ def learning_report(persist: bool = typer.Option(True, help="Persist generated r
 @app.command("learning-promotion-check")
 def learning_promotion_check(
     min_policy_settlements: int = typer.Option(50, min=1, help="Minimum active-policy settlements before model promotion."),
+    candidate_model: Path | None = typer.Option(None, help="Approved model artifact to promote."),
 ) -> None:
-    """Block model promotion until the active paper policy has enough verified evidence."""
+    """Allow model replacement only while the registry is fail-closed/no-trade."""
     settings = _settings()
     with connect(settings.sqlite_path) as conn:
         active = active_policy(conn)
-        if active is None:
-            typer.echo("model promotion blocked: no active policy")
+        if active is not None:
+            settlements = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM positions WHERE policy_version = ? AND status IN ('WON','LOST')",
+                    (active["version"],),
+                ).fetchone()[0]
+            )
+            typer.echo(
+                f"model promotion blocked: active_policy={active['version']} "
+                f"settlements={settlements}/{min_policy_settlements}; stop or supersede it first"
+            )
             raise typer.Exit(1)
-        settlements = int(
-            conn.execute(
-                "SELECT COUNT(*) FROM positions WHERE policy_version = ? AND status IN ('WON','LOST')",
-                (active["version"],),
-            ).fetchone()[0]
-        )
-    typer.echo(f"active_policy={active['version']} settlements={settlements}/{min_policy_settlements}")
-    if settlements < min_policy_settlements:
+    candidate_path = candidate_model or settings.probability_model_path.with_name(
+        f"{settings.probability_model_path.stem}.candidate{settings.probability_model_path.suffix}"
+    )
+    model = ProbabilityModel.load(candidate_path)
+    if model is None or not model.is_trade_approved():
+        typer.echo("model promotion blocked: candidate model is missing or diagnostic-only")
         raise typer.Exit(1)
+    typer.echo(f"model promotion allowed: policy_mode=observe candidate={candidate_path}")
 
 
 @app.command("learning-model-promoted")
@@ -543,11 +622,78 @@ def learning_model_promoted(sha256: str = typer.Option(..., help="Promoted model
     typer.echo(f"model_promotion_recorded={sha256.lower()} policy={version or 'none'}")
 
 
+@app.command("model-promote")
+def model_promote(
+    candidate_model: Path = typer.Option(
+        ...,
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+        readable=True,
+        help="Approved candidate model to install atomically.",
+    ),
+) -> None:
+    """Atomically install an approved model only while policy mode is no-trade."""
+    settings = _settings()
+    candidate = ProbabilityModel.load(candidate_model)
+    if candidate is None or not candidate.is_trade_approved():
+        typer.echo("model promotion blocked: candidate model is invalid or diagnostic-only")
+        raise typer.Exit(1)
+    model_bytes = candidate_model.read_bytes()
+    model_sha256 = hashlib.sha256(model_bytes).hexdigest()
+    destination = settings.probability_model_path
+    if candidate_model.resolve() == destination.resolve():
+        typer.echo("model promotion blocked: candidate already is the active model path")
+        raise typer.Exit(1)
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    staged = destination.with_name(f".{destination.name}.next")
+    backup = destination.with_name(f"{destination.stem}.previous{destination.suffix}")
+    had_active_model = destination.exists()
+    with connect(settings.sqlite_path) as conn:
+        active = active_policy(conn)
+        if active is not None:
+            typer.echo(f"model promotion blocked: active policy {active['version']} binds its current model")
+            raise typer.Exit(1)
+        try:
+            staged.write_bytes(model_bytes)
+            if hashlib.sha256(staged.read_bytes()).hexdigest() != model_sha256:
+                raise OSError("staged model checksum mismatch")
+            if had_active_model:
+                shutil.copy2(destination, backup)
+            staged.replace(destination)
+            record_evolution_event(
+                conn,
+                event_key=f"model:{model_sha256}:promoted",
+                policy_version=None,
+                event_type="model_promoted",
+                title="Probability model promoted",
+                summary="An approved model was installed atomically while policy mode was no-trade.",
+                occurred_at=datetime.now(UTC).isoformat(),
+                reason="Exact model artifact passed the approved-model contract.",
+                evidence_sha256=model_sha256,
+            )
+            conn.commit()
+        except Exception:
+            staged.unlink(missing_ok=True)
+            if had_active_model and backup.exists():
+                shutil.copy2(backup, destination)
+            elif not had_active_model:
+                destination.unlink(missing_ok=True)
+            raise
+    typer.echo(
+        f"model_promotion_ok=true active_model={destination} sha256={model_sha256}; "
+        "restart paper before activating the bound policy"
+    )
+
+
 @app.command("policy-optimize")
 def policy_optimize(
     version: str = typer.Option("btc-updown-v4-oos-15m", help="Immutable candidate version."),
-    register: bool = typer.Option(False, help="Register and auto-activate the eligible candidate in paper."),
+    register: bool = typer.Option(False, help="Register the eligible candidate without activating it."),
+    activate: bool = typer.Option(False, help="Activate after registration; the runtime model must match exactly."),
     evidence_output: Path | None = typer.Option(None, help="Evidence JSON path."),
+    model_output: Path | None = typer.Option(None, help="Exact train-split model artifact path."),
 ) -> None:
     """Select a full-gate 15m policy targeting 2-6 paper entries/day."""
     settings = _settings()
@@ -565,14 +711,30 @@ def policy_optimize(
         min_net_edges=(5.0, 8.0, 10.0, 12.0),
         settings=settings,
     )
-    best = recommend_policy(report["test_cells"], min_trades=20)
-    if best is None:
+    validated = select_validated_policy(
+        report,
+        min_trades=30,
+        min_profit_factor=1.25,
+        max_drawdown_pct=0.03,
+    ) if report["beats_market"] and report["test_markets"] >= 30 else None
+    if validated is None:
         typer.echo("no eligible policy: OOS safety/frequency gates failed")
         raise typer.Exit(1)
+    best = validated.verified_on_test
     config = policy_config(best)
-    evidence = policy_evidence(best, report)
+    evidence = policy_evidence(best, report, validated.selected_on_validation)
     destination = evidence_output or Path("artifacts/policy-evidence") / f"{version}.json"
+    model_destination = model_output or Path("artifacts/policy-evidence") / f"{version}.model.json"
     destination.parent.mkdir(parents=True, exist_ok=True)
+    model_destination.parent.mkdir(parents=True, exist_ok=True)
+    policy_model = _stamp_model_contract(report["model"], report["train"], report)
+    if not policy_model.is_trade_approved():
+        typer.echo("no eligible policy: exact train-split model failed the approved-model contract")
+        raise typer.Exit(1)
+    policy_model.save(model_destination)
+    model_bytes = model_destination.read_bytes()
+    model_sha256 = hashlib.sha256(model_bytes).hexdigest()
+    evidence["model_sha256"] = model_sha256
     evidence_bytes = (json.dumps(evidence, indent=2, sort_keys=True) + "\n").encode("utf-8")
     destination.write_bytes(evidence_bytes)
     typer.echo(
@@ -581,10 +743,12 @@ def policy_optimize(
     )
     typer.echo(f"config={json.dumps(config, sort_keys=True)}")
     typer.echo(f"evidence={destination}")
+    typer.echo(f"model={model_destination} sha256={model_sha256}")
+    if activate and not register:
+        typer.echo("activation blocked: --activate requires --register")
+        raise typer.Exit(1)
     if not register:
         return
-    model_path = settings.probability_model_path
-    model_sha256 = hashlib.sha256(model_path.read_bytes()).hexdigest() if model_path.exists() else None
     with connect(settings.sqlite_path) as conn:
         register_candidate(
             conn,
@@ -594,11 +758,10 @@ def policy_optimize(
             evidence_sha256=hashlib.sha256(evidence_bytes).hexdigest(),
             model_sha256=model_sha256,
         )
-        decision = auto_promote_best_candidate(conn, settings)
-    if decision is None or decision.status != "paper_active":
-        typer.echo(f"candidate registered but not activated: {decision.reason if decision else 'not eligible'}")
+        decision = activate_candidate(conn, version, settings) if activate else None
+    typer.echo(f"registered {version}; activation={decision.reason if decision else 'not requested'}")
+    if activate and decision is not None and decision.status != "paper_active":
         raise typer.Exit(1)
-    typer.echo(f"paper activation: {decision.reason}")
 
 
 @app.command("policy-register")
@@ -607,6 +770,7 @@ def policy_register(
     config_json: str = typer.Option(..., help="JSON object containing paper-only config overrides."),
     evidence_file: Path = typer.Option(..., exists=True, file_okay=True, dir_okay=False, readable=True),
     model_file: Path | None = typer.Option(None, exists=True, file_okay=True, dir_okay=False, readable=True),
+    activate: bool = typer.Option(False, help="Explicitly activate after all challenger gates pass."),
 ) -> None:
     """Register an OOS-tested candidate. It can only become active in paper."""
     settings = _settings()
@@ -618,7 +782,12 @@ def policy_register(
         oos_metrics = json.loads(evidence_bytes)
         if not isinstance(oos_metrics, dict):
             raise ValueError("evidence-file must contain a JSON object")
-        model_sha256 = hashlib.sha256(model_file.read_bytes()).hexdigest() if model_file else None
+        model_sha256 = None
+        if model_file:
+            model = ProbabilityModel.load(model_file)
+            if model is None or not model.is_trade_approved():
+                raise ValueError("model-file is missing, invalid, or diagnostic-only")
+            model_sha256 = hashlib.sha256(model_file.read_bytes()).hexdigest()
         with connect(settings.sqlite_path) as conn:
             register_candidate(
                 conn,
@@ -628,12 +797,14 @@ def policy_register(
                 evidence_sha256=hashlib.sha256(evidence_bytes).hexdigest(),
                 model_sha256=model_sha256,
             )
-            decision = auto_promote_best_candidate(conn, settings)
+            decision = activate_candidate(conn, version, settings) if activate else None
     except (json.JSONDecodeError, ValueError) as exc:
         typer.echo(f"candidate rejected: {exc}")
         raise typer.Exit(1) from exc
     typer.echo(f"registered {version}")
-    typer.echo(f"auto-promotion: {decision.reason if decision else 'not eligible or active policy exists'}")
+    typer.echo(f"activation: {decision.reason if decision else 'not requested'}")
+    if activate and decision is not None and decision.status != "paper_active":
+        raise typer.Exit(1)
 
 
 @app.command("policy-status")
@@ -655,6 +826,22 @@ def policy_status(evaluate: bool = typer.Option(False, help="Evaluate and transi
             f"{item['version']} status={item['status']} trades={metrics.get('trades', 0)} "
             f"pnl={float(metrics.get('pnl_usdc') or 0):+.2f} drawdown={_fmt_pct(metrics.get('max_drawdown_pct'))}"
         )
+
+
+@app.command("policy-stop")
+def policy_stop(
+    version: str = typer.Option(..., help="Active policy version to stop."),
+    reason: str = typer.Option("manual fail-closed stop", help="Audited stop reason."),
+) -> None:
+    """Explicitly enter NO TRADE without restoring an older policy."""
+    settings = _settings()
+    try:
+        with connect(settings.sqlite_path) as conn:
+            stop_active_policy(conn, version, reason)
+    except ValueError as exc:
+        typer.echo(f"policy stop rejected: {exc}")
+        raise typer.Exit(1) from exc
+    typer.echo(f"stopped {version}; policy_mode=observe")
 
 
 @app.command("policy-experiment-activate")
@@ -705,7 +892,6 @@ def live(max_cycles: int | None = typer.Option(None, help="Stop after N cycles; 
         typer.echo(f"geoblock blocked live mode: {geoblock.reason}")
         raise typer.Exit(1)
     typer.echo("live startup checks passed; starting live loop (Ctrl+C to stop)")
-    configure_logging(settings)
     asyncio.run(run_live_loop(settings, max_cycles=max_cycles))
 
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+
 from bot.config import Settings
 from bot.execution.paper_broker import polymarket_taker_fee_usdc
 from bot.polymarket.models import MarketContext, OrderBook, OutcomeSide, Signal, SignalAction
@@ -14,31 +16,71 @@ def kelly_fraction(probability: float, price: float) -> float:
 
 
 class MomentumBookImbalanceStrategy(Strategy):
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, observer_only: bool = False):
         self.settings = settings
+        self.observer_only = observer_only
         self.config_snapshot = settings.strategy_config_snapshot()
         # A calibrated model (trained via `cli calibrate`) supersedes the hand-tuned
         # heuristic when present; otherwise we fall back to the heuristic scoring.
         # Models trained with an older feature layout are ignored, not misapplied.
         model = ProbabilityModel.load(settings.probability_model_path)
         self.model: ProbabilityModel | None = model if model is not None and model.is_compatible() else None
+        self.model_sha256 = (
+            hashlib.sha256(settings.probability_model_path.read_bytes()).hexdigest()
+            if self.model is not None and settings.probability_model_path.exists()
+            else None
+        )
+
+    def _model_is_trade_approved(self) -> bool:
+        if self.model is None or not self.model.is_trade_approved():
+            return False
+        if self.settings.policy_mode != "active":
+            return True
+        expected = self.settings.policy_model_sha256
+        return bool(expected and self.model_sha256 == expected)
+
+    def _uses_calibrated_model(self) -> bool:
+        return bool(
+            self.model is not None
+            and (
+                not self.settings.require_approved_probability_model
+                or self._model_is_trade_approved()
+            )
+        )
 
     def evaluate(self, context: MarketContext) -> Signal:
         signal = self._evaluate_primary(context)
         metadata = dict(signal.metadata or {})
         metadata["primary_reason"] = signal.reason
         metadata["failed_gates"] = self._failed_gates(context)
+        if self.observer_only:
+            metadata["observer_candidate_action"] = signal.action.value
+            return signal.model_copy(
+                update={
+                    "action": SignalAction.HOLD,
+                    "max_price": 0.0,
+                    "size_usdc": 0.0,
+                    "reason": "no active validated paper policy",
+                    "metadata": metadata,
+                }
+            )
         return signal.model_copy(update={"metadata": metadata})
 
     def _evaluate_primary(self, context: MarketContext) -> Signal:
-        if not self.settings.enable_experimental_strategy:
+        if not self.settings.enable_experimental_strategy and not self.observer_only:
             return self._hold("experimental strategy disabled", context)
+        if (
+            self.settings.require_approved_probability_model
+            and not self.observer_only
+            and not self._model_is_trade_approved()
+        ):
+            return self._hold("no approved probability model", context)
         if not context.market.is_tradeable:
             return self._hold("market not verified tradeable", context)
         if not context.up_book or not context.down_book:
             return self._hold("missing order book", context)
 
-        max_age = 3 if context.market.market_type.value == "5m" else 5
+        max_age = self.settings.btc_price_max_age_seconds
         if not context.btc.is_fresh(max_age):
             return self._hold("stale BTC feed", context)
         min_seconds_to_close = self.settings.minimum_seconds_to_close_for(context.market.market_type.value)
@@ -74,13 +116,19 @@ class MomentumBookImbalanceStrategy(Strategy):
         """
         failures: list[str] = []
         market_type = context.market.market_type.value
-        if not self.settings.enable_experimental_strategy:
+        if not self.settings.enable_experimental_strategy and not self.observer_only:
             failures.append("strategy.experimental_disabled")
+        if (
+            self.settings.require_approved_probability_model
+            and not self.observer_only
+            and not self._model_is_trade_approved()
+        ):
+            failures.append("strategy.model_not_approved")
         if not context.market.is_tradeable:
             failures.append("market.not_tradeable")
         if not context.up_book or not context.down_book:
             failures.append("market.missing_order_book")
-        max_age = 3 if market_type == "5m" else 5
+        max_age = self.settings.btc_price_max_age_seconds
         if not context.btc.is_fresh(max_age):
             failures.append("feed.stale_btc")
         min_seconds = self.settings.minimum_seconds_to_close_for(market_type)
@@ -289,7 +337,8 @@ class MomentumBookImbalanceStrategy(Strategy):
 
     def _estimate_probability(self, context: MarketContext, book: OrderBook, price: float, direction: int) -> tuple[float, str]:
         """Estimate P(chosen side wins). Uses the calibrated model if loaded, else the heuristic."""
-        if self.model is not None:
+        if self._uses_calibrated_model():
+            assert self.model is not None
             features = build_features(
                 momentum_15s=context.btc.momentum_15s,
                 momentum_60s=context.btc.momentum_60s,
@@ -348,7 +397,8 @@ class MomentumBookImbalanceStrategy(Strategy):
             "config_snapshot": self.config_snapshot,
             "market_type": context.market.market_type.value,
             "seconds_to_close": context.market.seconds_to_close,
-            "probability_source": "calibrated" if self.model is not None else "heuristic",
+            "probability_source": "calibrated" if self._uses_calibrated_model() else "heuristic",
+            "model_sha256": self.model_sha256,
         }
         if metadata:
             payload.update(metadata)

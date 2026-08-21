@@ -86,35 +86,36 @@ def _snapshot_index(conn: sqlite3.Connection) -> dict[str, list[tuple[float, flo
     return index
 
 
-def _nearest_snapshot(
+def _prior_snapshot(
     index: dict[str, list[tuple[float, float, float]]],
     token_id: str,
     timestamp: float,
     max_gap_seconds: float,
 ) -> tuple[float, float] | None:
-    """(best_ask, imbalance) of the snapshot closest to `timestamp`, or None."""
+    """Latest known (best_ask, imbalance) at or before `timestamp`, or None."""
     entries = index.get(token_id)
     if not entries:
         return None
-    position = bisect.bisect_left(entries, (timestamp,))
-    best: tuple[float, tuple[float, float, float]] | None = None
-    for candidate in (position - 1, position):
-        if 0 <= candidate < len(entries):
-            gap = abs(entries[candidate][0] - timestamp)
-            if best is None or gap < best[0]:
-                best = (gap, entries[candidate])
-    if best is None or best[0] > max_gap_seconds:
+    position = bisect.bisect_right(entries, (timestamp, float("inf"), float("inf"))) - 1
+    if position < 0:
         return None
-    return best[1][1], best[1][2]
+    snapshot = entries[position]
+    if timestamp - snapshot[0] > max_gap_seconds:
+        return None
+    return snapshot[1], snapshot[2]
 
 
-def build_training_rows(conn: sqlite3.Connection, snapshot_max_gap_seconds: float = 30.0) -> list[TrainingRow]:
-    """Build the unbiased, time-sorted training dataset from stored decisions."""
+def build_training_rows(
+    conn: sqlite3.Connection,
+    snapshot_max_gap_seconds: float = 30.0,
+    sample_bucket_seconds: int = 15,
+) -> list[TrainingRow]:
+    """Build a market-safe dataset with one observation per side/time bucket."""
     from bot.strategy.calibration import build_features
 
     markets = _resolved_markets(conn)
     snapshots = _snapshot_index(conn)
-    rows: list[TrainingRow] = []
+    rows_by_bucket: dict[tuple[str, str, int], TrainingRow] = {}
     decisions = conn.execute(
         "SELECT market_id, metadata_json, created_at FROM strategy_decisions ORDER BY created_at ASC"
     ).fetchall()
@@ -134,33 +135,37 @@ def build_training_rows(conn: sqlite3.Connection, snapshot_max_gap_seconds: floa
             continue
         seconds_to_close = float(features.get("seconds_to_close") or 0.0)
         for side, sign in (("UP", 1), ("DOWN", -1)):
-            snapshot = _nearest_snapshot(snapshots, market["tokens"][side], timestamp, snapshot_max_gap_seconds)
+            snapshot = _prior_snapshot(snapshots, market["tokens"][side], timestamp, snapshot_max_gap_seconds)
             if snapshot is None:
                 continue
             ask, imbalance = snapshot
             if not 0.01 <= ask <= 0.99:
                 continue
-            rows.append(
-                TrainingRow(
-                    features=build_features(
-                        momentum_15s=float(features.get("momentum_15s") or 0.0),
-                        momentum_60s=float(features.get("momentum_60s") or 0.0),
-                        change_since_open=float(features.get("change_since_open") or 0.0),
-                        realized_volatility=float(features.get("realized_volatility") or 0.0),
-                        book_imbalance=imbalance,
-                        implied=ask,
-                        sign=sign,
-                        seconds_to_close=seconds_to_close,
-                    ),
-                    label=1 if market["winner"] == side else 0,
-                    epoch=timestamp,
-                    created_at=str(decision["created_at"]),
-                    market_id=decision["market_id"],
-                    market_type=market["market_type"],
-                    side=side,
-                    ask=ask,
+            row = TrainingRow(
+                features=build_features(
+                    momentum_15s=float(features.get("momentum_15s") or 0.0),
+                    momentum_60s=float(features.get("momentum_60s") or 0.0),
+                    change_since_open=float(features.get("change_since_open") or 0.0),
+                    realized_volatility=float(features.get("realized_volatility") or 0.0),
+                    book_imbalance=imbalance,
+                    implied=ask,
+                    sign=sign,
                     seconds_to_close=seconds_to_close,
-                )
+                ),
+                label=1 if market["winner"] == side else 0,
+                epoch=timestamp,
+                created_at=str(decision["created_at"]),
+                market_id=decision["market_id"],
+                market_type=market["market_type"],
+                side=side,
+                ask=ask,
+                seconds_to_close=seconds_to_close,
             )
+            bucket = int(timestamp // max(1, sample_bucket_seconds))
+            key = (row.market_id, row.side, bucket)
+            previous = rows_by_bucket.get(key)
+            if previous is None or row.epoch < previous.epoch:
+                rows_by_bucket[key] = row
+    rows = list(rows_by_bucket.values())
     rows.sort(key=lambda row: row.epoch)
     return rows

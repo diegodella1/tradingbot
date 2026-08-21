@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
+from pydantic import ValidationError
+
 from bot.config import Settings
 from bot.learning.evolution import (
     EVOLUTION_MIN_DECISION_SAMPLE,
@@ -54,6 +56,13 @@ PAPER_CONFIG_KEYS = {
     "min_kelly_size_usdc",
     "max_trade_pct_15m",
 }
+
+CHALLENGER_MIN_OOS_TRADES = 30
+CHALLENGER_MIN_TEST_MARKETS = 30
+CHALLENGER_MIN_PROFIT_FACTOR = 1.25
+CHALLENGER_MAX_DRAWDOWN_PCT = 0.03
+CHALLENGER_MIN_TRADES_PER_DAY = 2.0
+CHALLENGER_MAX_TRADES_PER_DAY = 6.0
 
 
 @dataclass(frozen=True)
@@ -130,9 +139,19 @@ def active_policy(conn: sqlite3.Connection) -> dict[str, Any] | None:
 def apply_active_policy(settings: Settings, conn: sqlite3.Connection) -> Settings:
     policy = active_policy(conn)
     if policy is None:
-        return settings
+        has_registry = conn.execute("SELECT 1 FROM policy_versions LIMIT 1").fetchone() is not None
+        if has_registry:
+            return settings.model_copy(
+                update={
+                    "enable_experimental_strategy": False,
+                    "policy_mode": "observe",
+                }
+            )
+        return settings.model_copy(update={"policy_mode": "unmanaged"})
     config = _validated_config(policy["config"])
     config["policy_version"] = policy["version"]
+    config["policy_model_sha256"] = policy["model_sha256"]
+    config["policy_mode"] = "active"
     return settings.model_copy(update=config)
 
 
@@ -189,7 +208,11 @@ def evaluate_policy(conn: sqlite3.Connection, version: str, settings: Settings) 
             metrics=metrics,
         )
     reasons = _failed_gates(metrics, settings)
-    if metrics["max_drawdown_pct"] > settings.policy_max_drawdown_pct:
+    interim_failures = _interim_failures(metrics, settings)
+    if interim_failures:
+        status = "stopped"
+        reasons = interim_failures
+    elif metrics["max_drawdown_pct"] > settings.policy_max_drawdown_pct:
         status = "stopped"
     elif metrics["trades"] < settings.policy_min_forward_trades:
         status = "paper_active"
@@ -241,15 +264,36 @@ def evaluate_and_transition(conn: sqlite3.Connection, version: str, settings: Se
             reason=decision.reason,
         )
         conn.commit()
-    if decision.status == "stopped":
-        _restore_previous_policy(conn, version)
+    if decision.status in {"stopped", "rejected"}:
+        _enter_no_trade(conn, version, decision.reason)
     return decision
 
 
+def _enter_no_trade(conn: sqlite3.Connection, stopped_version: str, reason: str) -> None:
+    """Cancel pending paper orders and leave registry without an active policy."""
+    now = datetime.now(UTC).isoformat()
+    with conn:
+        conn.execute(
+            "UPDATE orders SET status='CANCELED', reason='policy stopped; no-trade', updated_at=? "
+            "WHERE policy_version=? AND execution_style='maker' AND status IN ('OPEN','PARTIALLY_FILLED')",
+            (now, stopped_version),
+        )
+        record_evolution_event(
+            conn,
+            event_key=f"policy:{stopped_version}:no-trade",
+            policy_version=stopped_version,
+            event_type="no_trade_entered",
+            title="Paper entries suspended",
+            summary="No active policy remains; data collection continues without entries.",
+            occurred_at=now,
+            reason=reason,
+        )
+
+
 def activate_paper_experiment(conn: sqlite3.Connection, version: str, settings: Settings) -> PromotionDecision:
-    """Explicitly activate a small, paper-only maker experiment below normal OOS gates."""
+    """Explicitly activate a paper-only maker challenger after evidence gates pass."""
     row = conn.execute(
-        "SELECT status, is_active, config_json, oos_metrics_json, evidence_sha256 FROM policy_versions WHERE version = ?",
+        "SELECT status, is_active, config_json, oos_metrics_json, evidence_sha256, model_sha256 FROM policy_versions WHERE version = ?",
         (version,),
     ).fetchone()
     if row is None:
@@ -265,7 +309,16 @@ def activate_paper_experiment(conn: sqlite3.Connection, version: str, settings: 
         return PromotionDecision("candidate", "OOS evidence checksum is required", {})
     if config.get("paper_order_style") != "maker" or not config.get("paper_experiment_enabled"):
         return PromotionDecision("candidate", "explicit maker experiment config is required", {})
+    oos = json.loads(row["oos_metrics_json"] or "{}")
+    failures = _challenger_failures(oos, row["model_sha256"])
+    failures.extend(_configured_model_failures(settings, row["model_sha256"]))
+    if failures:
+        return PromotionDecision("candidate", "; ".join(failures), oos)
     previous = active_policy(conn)
+    if previous is not None and previous["version"] != version:
+        ready, reason = predecessor_experiment_ready(conn, previous["version"])
+        if not ready:
+            return PromotionDecision("candidate", reason, oos)
     now = datetime.now(UTC).isoformat()
     with conn:
         conn.execute(
@@ -295,7 +348,7 @@ def predecessor_experiment_ready(
     conn: sqlite3.Connection,
     version: str,
     *,
-    min_fills: int = 20,
+    min_fills: int = 50,
 ) -> tuple[bool, str]:
     """Allow a successor only after its predecessor matures or reaches a terminal state."""
     row = conn.execute("SELECT status FROM policy_versions WHERE version = ?", (version,)).fetchone()
@@ -372,9 +425,42 @@ def rollback_paper_experiment(conn: sqlite3.Connection, version: str, reason: st
     return active["version"] if active else None
 
 
+def stop_active_policy(
+    conn: sqlite3.Connection,
+    version: str,
+    reason: str = "manual fail-closed stop",
+) -> None:
+    """Explicitly stop one active policy without restoring any predecessor."""
+    target = conn.execute(
+        "SELECT is_active FROM policy_versions WHERE version = ?",
+        (version,),
+    ).fetchone()
+    if target is None:
+        raise ValueError(f"unknown policy version: {version}")
+    if not bool(target["is_active"]):
+        raise ValueError(f"policy {version} is not active")
+    now = datetime.now(UTC).isoformat()
+    with conn:
+        conn.execute(
+            "UPDATE policy_versions SET status='stopped', is_active=0, rejection_reason=?, evaluated_at=? WHERE version=?",
+            (reason, now, version),
+        )
+        record_evolution_event(
+            conn,
+            event_key=f"policy:{version}:manual-no-trade",
+            policy_version=version,
+            event_type="stopped",
+            title="Policy stopped manually",
+            summary=reason,
+            occurred_at=now,
+            reason=reason,
+        )
+    _enter_no_trade(conn, version, reason)
+
+
 def activate_candidate(conn: sqlite3.Connection, version: str, settings: Settings) -> PromotionDecision:
     row = conn.execute(
-        "SELECT status, oos_metrics_json, evidence_sha256 FROM policy_versions WHERE version = ?",
+        "SELECT status, oos_metrics_json, evidence_sha256, model_sha256 FROM policy_versions WHERE version = ?",
         (version,),
     ).fetchone()
     if row is None:
@@ -384,18 +470,15 @@ def activate_candidate(conn: sqlite3.Connection, version: str, settings: Setting
     if settings.policy_require_evidence_hash and not row["evidence_sha256"]:
         return PromotionDecision("candidate", "OOS evidence checksum is required", {})
     oos = json.loads(row["oos_metrics_json"] or "{}")
-    windows = int(oos.get("windows") or 0)
-    profitable_windows = int(oos.get("profitable_windows") or 0)
-    required = (
-        int(oos.get("trades") or 0) >= 20
-        and float(oos.get("pnl_usdc") or 0) > 0
-        and float(oos.get("roi") or 0) > 0
-        and windows > 0
-        and profitable_windows > windows / 2
-    )
-    if not required:
-        return PromotionDecision("candidate", "OOS gate requires >=20 trades, positive PnL/ROI and a majority of profitable windows", oos)
+    failures = _challenger_failures(oos, row["model_sha256"])
+    failures.extend(_configured_model_failures(settings, row["model_sha256"]))
+    if failures:
+        return PromotionDecision("candidate", "; ".join(failures), oos)
     previous = active_policy(conn)
+    if previous is not None and previous["version"] != version:
+        ready, reason = predecessor_experiment_ready(conn, previous["version"])
+        if not ready:
+            return PromotionDecision("candidate", reason, oos)
     now = datetime.now(UTC).isoformat()
     with conn:
         conn.execute(
@@ -452,23 +535,15 @@ def auto_promote_best_candidate(conn: sqlite3.Connection, settings: Settings) ->
         if champion_settlements < EVOLUTION_MIN_DECISION_SAMPLE:
             return None
     candidates = [item for item in list_policies(conn) if item["status"] == "candidate"]
-    eligible = [
-        item
-        for item in candidates
-        if int(item["oos_metrics"].get("trades") or 0) >= 20
-        and float(item["oos_metrics"].get("pnl_usdc") or 0) > 0
-        and float(item["oos_metrics"].get("roi") or 0) > 0
-        and int(item["oos_metrics"].get("windows") or 0) > 0
-        and int(item["oos_metrics"].get("profitable_windows") or 0) > int(item["oos_metrics"].get("windows") or 0) / 2
-    ]
+    eligible = [item for item in candidates if not _challenger_failures(item["oos_metrics"], item["model_sha256"])]
     if not eligible:
         return None
     best = max(eligible, key=lambda item: (float(item["oos_metrics"].get("pnl_usdc") or 0), int(item["oos_metrics"].get("trades") or 0)))
     return activate_candidate(conn, best["version"], settings)
 
 
-def ensure_baseline_policy(conn: sqlite3.Connection, settings: Settings) -> dict[str, Any]:
-    """Register configured paper policy when database predates lifecycle tracking."""
+def ensure_baseline_policy(conn: sqlite3.Connection, settings: Settings) -> dict[str, Any] | None:
+    """Register the configured baseline without trusting it on a fresh database."""
     active = active_policy(conn)
     if active is not None:
         return active
@@ -490,13 +565,12 @@ def ensure_baseline_policy(conn: sqlite3.Connection, settings: Settings) -> dict
         """
         INSERT INTO policy_versions (
             version, status, is_active, config_json, config_sha256, created_at, activated_at
-        ) VALUES (?, 'paper_active', 1, ?, ?, ?, ?)
+        ) VALUES (?, 'candidate', 0, ?, ?, ?, NULL)
         """,
         (
             settings.policy_version,
             config_json,
             hashlib.sha256(config_json.encode("utf-8")).hexdigest(),
-            now,
             now,
         ),
     )
@@ -506,21 +580,12 @@ def ensure_baseline_policy(conn: sqlite3.Connection, settings: Settings) -> dict
         policy_version=settings.policy_version,
         event_type="registered",
         title="Baseline policy registered",
-        summary="Configured baseline registered when lifecycle tracking started.",
+        summary="Configured baseline registered as an inactive observer candidate.",
         occurred_at=now,
         config_delta=config_delta(None, config),
     )
-    record_evolution_event(
-        conn,
-        event_key=f"policy:{settings.policy_version}:activated",
-        policy_version=settings.policy_version,
-        event_type="activated",
-        title="Baseline paper policy activated",
-        summary="Configured baseline became the active paper policy.",
-        occurred_at=now,
-    )
     conn.commit()
-    return active_policy(conn)
+    return None
 
 
 def list_policies(conn: sqlite3.Connection) -> list[dict[str, Any]]:
@@ -589,14 +654,91 @@ def _failed_gates(metrics: dict[str, Any], settings: Settings) -> list[str]:
     return reasons
 
 
+def _interim_failures(metrics: dict[str, Any], settings: Settings) -> list[str]:
+    trades = int(metrics["trades"] or 0)
+    pnl = float(metrics["pnl_usdc"] or 0)
+    drawdown = float(metrics["max_drawdown_pct"] or 0)
+    if pnl <= -abs(settings.policy_interim_stop_loss_usdc):
+        return [f"interim hard stop: PnL {pnl:+.2f} USDC"]
+    if drawdown >= settings.policy_interim_max_drawdown_pct:
+        return [f"interim hard stop: drawdown {drawdown:.1%}"]
+    if trades < settings.policy_interim_min_trades:
+        return []
+    win_rate = metrics["win_rate"]
+    break_even = metrics["breakeven_win_rate"]
+    under_break_even = win_rate is None or break_even is None or win_rate <= break_even
+    if pnl < 0 and float(metrics["profit_factor"] or 0) < 1 and under_break_even:
+        return ["interim gate failed: negative PnL, profit factor below 1, and win rate below break-even"]
+    return []
+
+
 def _validated_config(config: dict[str, Any]) -> dict[str, Any]:
     unknown = set(config) - PAPER_CONFIG_KEYS
     if unknown:
         raise ValueError(f"unsupported paper policy keys: {', '.join(sorted(unknown))}")
-    maker_offset = float(config.get("paper_maker_bid_offset_cents") or 0)
+    try:
+        validated = Settings.model_validate(config)
+    except ValidationError as exc:
+        raise ValueError(f"invalid paper policy config: {exc}") from exc
+    clean = {key: getattr(validated, key) for key in config}
+    maker_offset = float(clean.get("paper_maker_bid_offset_cents") or 0)
     if not 0 <= maker_offset <= 99 or not math.isfinite(maker_offset):
         raise ValueError("paper_maker_bid_offset_cents must be between 0 and 99")
-    return {key: value for key, value in config.items() if key in PAPER_CONFIG_KEYS}
+    unit_interval_keys = {
+        "min_confidence",
+        "min_estimated_probability",
+        "min_probability_15m",
+        "min_probability_5m",
+        "min_entry_price",
+        "min_entry_price_15m",
+        "max_entry_price",
+        "paper_experiment_max_drawdown_pct",
+        "paper_experiment_min_fill_rate",
+        "max_trade_pct_15m",
+        "min_book_imbalance",
+    }
+    for key in unit_interval_keys & clean.keys():
+        value = float(clean[key])
+        if not math.isfinite(value) or not 0 <= value <= 1:
+            raise ValueError(f"{key} must be between 0 and 1")
+    nonnegative_keys = {
+        "min_edge_cents",
+        "min_net_edge_cents",
+        "min_net_edge_15m_cents",
+        "min_net_edge_5m_cents",
+        "paper_trade_size_usdc",
+        "paper_max_trade_size_usdc",
+        "paper_experiment_stop_loss_usdc",
+        "paper_experiment_min_profit_factor",
+        "max_daily_loss_usdc",
+        "min_kelly_size_usdc",
+    }
+    for key in nonnegative_keys & clean.keys():
+        value = float(clean[key])
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(f"{key} must be non-negative")
+    positive_integer_keys = {
+        "max_trades_per_hour",
+        "max_trades_per_day",
+        "paper_maker_fill_window_seconds",
+        "paper_experiment_min_fills",
+        "min_seconds_to_close",
+        "min_seconds_to_close_5m",
+        "min_seconds_to_close_15m",
+        "max_consecutive_losses",
+    }
+    for key in positive_integer_keys & clean.keys():
+        if clean[key] is not None and int(clean[key]) < 1:
+            raise ValueError(f"{key} must be at least 1")
+    if "market_types" in clean and not clean["market_types"]:
+        raise ValueError("market_types cannot be empty")
+    if "market_types" in clean and not set(clean["market_types"]) <= {"5m", "15m"}:
+        raise ValueError("market_types must contain only 5m and/or 15m")
+    min_entry = float(clean.get("min_entry_price", validated.min_entry_price))
+    max_entry = float(clean.get("max_entry_price", validated.max_entry_price))
+    if min_entry > max_entry:
+        raise ValueError("min_entry_price cannot exceed max_entry_price")
+    return clean
 
 
 def _validated_oos_metrics(metrics: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -619,7 +761,102 @@ def _validated_oos_metrics(metrics: dict[str, Any] | None) -> dict[str, Any] | N
         raise ValueError("OOS profitable_windows must be between zero and windows")
     if not all(math.isfinite(clean[key]) for key in ("pnl_usdc", "roi")):
         raise ValueError("OOS PnL and ROI must be finite")
+    for key in ("profit_factor", "max_drawdown_pct", "trades_per_day"):
+        if key in metrics and metrics[key] is not None:
+            clean[key] = float(metrics[key])
+            if not math.isfinite(clean[key]):
+                raise ValueError(f"OOS {key} must be finite")
+    for key in ("test_markets", "validation_markets", "train_markets"):
+        if key in metrics and metrics[key] is not None:
+            clean[key] = int(metrics[key])
+            if clean[key] < 0:
+                raise ValueError(f"OOS {key} must be non-negative")
+    if "method" in metrics:
+        clean["method"] = str(metrics["method"])
+    if isinstance(metrics.get("selection_metrics"), dict):
+        clean["selection_metrics"] = dict(metrics["selection_metrics"])
+    validation = metrics.get("model_validation")
+    if validation is not None:
+        if not isinstance(validation, dict):
+            raise ValueError("OOS model_validation must be an object")
+        required_validation = {
+            "test_log_loss",
+            "market_log_loss",
+            "test_brier_score",
+            "market_brier_score",
+            "beats_market",
+        }
+        missing_validation = required_validation - set(validation)
+        if missing_validation:
+            raise ValueError(f"missing OOS model validation: {', '.join(sorted(missing_validation))}")
+        clean_validation = {
+            key: float(validation[key])
+            for key in required_validation - {"beats_market"}
+        }
+        if not all(math.isfinite(value) for value in clean_validation.values()):
+            raise ValueError("OOS model validation metrics must be finite")
+        clean_validation["beats_market"] = bool(validation["beats_market"])
+        clean["model_validation"] = clean_validation
     return clean
+
+
+def _challenger_failures(oos: dict[str, Any], model_sha256: str | None) -> list[str]:
+    failures: list[str] = []
+    windows = int(oos.get("windows") or 0)
+    profitable_windows = int(oos.get("profitable_windows") or 0)
+    if int(oos.get("trades") or 0) < CHALLENGER_MIN_OOS_TRADES:
+        failures.append(f"OOS trades below {CHALLENGER_MIN_OOS_TRADES}")
+    if float(oos.get("pnl_usdc") or 0) <= 0 or float(oos.get("roi") or 0) <= 0:
+        failures.append("OOS PnL and ROI must be positive")
+    if float(oos.get("profit_factor") or 0) < CHALLENGER_MIN_PROFIT_FACTOR:
+        failures.append(f"OOS profit factor below {CHALLENGER_MIN_PROFIT_FACTOR:.2f}")
+    drawdown = float(oos["max_drawdown_pct"]) if oos.get("max_drawdown_pct") is not None else math.inf
+    if drawdown > CHALLENGER_MAX_DRAWDOWN_PCT:
+        failures.append(f"OOS drawdown exceeds {CHALLENGER_MAX_DRAWDOWN_PCT:.0%}")
+    frequency = float(oos.get("trades_per_day") or 0)
+    if not CHALLENGER_MIN_TRADES_PER_DAY <= frequency <= CHALLENGER_MAX_TRADES_PER_DAY:
+        failures.append(
+            f"OOS frequency must be {CHALLENGER_MIN_TRADES_PER_DAY:g}-{CHALLENGER_MAX_TRADES_PER_DAY:g}/day"
+        )
+    if windows <= 0 or profitable_windows <= windows / 2:
+        failures.append("OOS requires a majority of profitable windows")
+    if int(oos.get("test_markets") or 0) < CHALLENGER_MIN_TEST_MARKETS:
+        failures.append(f"OOS test markets below {CHALLENGER_MIN_TEST_MARKETS}")
+    validation = oos.get("model_validation") or {}
+    test_log_loss = float(validation["test_log_loss"]) if validation.get("test_log_loss") is not None else math.inf
+    market_log_loss = float(validation["market_log_loss"]) if validation.get("market_log_loss") is not None else -math.inf
+    test_brier = float(validation["test_brier_score"]) if validation.get("test_brier_score") is not None else math.inf
+    market_brier = float(validation["market_brier_score"]) if validation.get("market_brier_score") is not None else -math.inf
+    model_beats_market = (
+        bool(validation.get("beats_market"))
+        and test_log_loss < market_log_loss
+        and test_brier < market_brier
+    )
+    if not model_beats_market:
+        failures.append("probability model does not beat the market OOS")
+    if not model_sha256:
+        failures.append("approved probability model checksum is required")
+    return failures
+
+
+def _configured_model_failures(settings: Settings, expected_sha256: str | None) -> list[str]:
+    """Require activation to bind the policy to the exact approved runtime model."""
+    if not settings.require_approved_probability_model:
+        return []
+
+    from bot.strategy.calibration import ProbabilityModel
+
+    try:
+        model_bytes = settings.probability_model_path.read_bytes()
+        model = ProbabilityModel.from_json(model_bytes.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, TypeError, ValueError, json.JSONDecodeError):
+        return ["configured probability model is missing or invalid"]
+    if not model.is_trade_approved():
+        return ["configured probability model is diagnostic-only"]
+    actual_sha256 = hashlib.sha256(model_bytes).hexdigest()
+    if not expected_sha256 or actual_sha256 != expected_sha256:
+        return ["candidate model checksum does not match the configured runtime model"]
+    return []
 
 
 def _validate_optional_sha256(value: str | None, name: str) -> None:

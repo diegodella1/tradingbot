@@ -92,3 +92,46 @@ def test_build_training_rows_respects_snapshot_gap(settings):
         rows = build_training_rows(conn)
 
     assert rows == []
+
+
+def test_build_training_rows_never_uses_future_snapshot(settings):
+    init_db(settings.sqlite_path)
+    with connect(settings.sqlite_path) as conn:
+        _insert_market(conn, "m1", "1", "0")
+        _insert_snapshot(conn, "m1", "up-token", 0.55, "2026-01-01T00:00:01+00:00")
+        _insert_snapshot(conn, "m1", "down-token", 0.47, "2026-01-01T00:00:01+00:00")
+        _insert_hold_decision(conn, "m1", "2026-01-01T00:00:00+00:00")
+        conn.commit()
+
+        rows = build_training_rows(conn)
+
+    assert rows == []
+
+
+def test_build_training_rows_deduplicates_each_market_side_time_bucket(settings):
+    init_db(settings.sqlite_path)
+    with connect(settings.sqlite_path) as conn:
+        _insert_market(conn, "m1", "1", "0")
+        for second, remaining in ((0, 410), (2, 408), (20, 390)):
+            ts = f"2026-01-01T00:00:{second:02d}+00:00"
+            _insert_snapshot(conn, "m1", "up-token", 0.55, ts)
+            _insert_snapshot(conn, "m1", "down-token", 0.47, ts)
+            metadata = {
+                "features": {
+                    "momentum_15s": 0.001,
+                    "momentum_60s": 0.002,
+                    "change_since_open": 10.0,
+                    "realized_volatility": 0.0001,
+                    "book_imbalance": 0.1,
+                    "seconds_to_close": remaining,
+                }
+            }
+            conn.execute(
+                "INSERT INTO strategy_decisions (market_id, market_type, action, confidence, reason, metadata_json, created_at) VALUES (?, '5m', 'HOLD', 0, 'test', ?, ?)",
+                ("m1", json.dumps(metadata), ts),
+            )
+        conn.commit()
+
+        rows = build_training_rows(conn, sample_bucket_seconds=15)
+
+    assert len(rows) == 4  # two sides across two 15-second buckets

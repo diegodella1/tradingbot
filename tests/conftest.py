@@ -16,6 +16,7 @@ def settings(tmp_path):
         # Keep tests hermetic: never pick up a real trained model from the repo root.
         probability_model_path=tmp_path / "probability_model.json",
         enable_experimental_strategy=False,
+        require_approved_probability_model=False,
         min_seconds_to_close=45,
         min_seconds_to_close_5m=45,
         min_seconds_to_close_15m=45,

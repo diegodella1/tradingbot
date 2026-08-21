@@ -116,13 +116,21 @@ def test_analytics_payload_is_cached_and_single_flight(monkeypatch):
 
     monkeypatch.setattr(web, "_build_analytics_payload", payload)
     results = []
-    workers = [threading.Thread(target=lambda: results.append(web.analytics_payload())) for _ in range(8)]
+    ready = threading.Barrier(9)
+
+    def worker() -> None:
+        ready.wait()
+        results.append(web.analytics_payload())
+
+    workers = [threading.Thread(target=worker) for _ in range(8)]
     for worker in workers:
         worker.start()
+    ready.wait()
     assert started.wait(timeout=1)
     release.set()
     for worker in workers:
-        worker.join(timeout=2)
+        worker.join(timeout=5)
+        assert not worker.is_alive()
 
     assert len(results) == 8
     assert all(result == results[0] for result in results)

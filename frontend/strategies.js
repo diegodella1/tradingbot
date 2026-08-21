@@ -44,9 +44,10 @@ function sideClass(action) {
 
 function renderRuntime(data) {
   const safe = (data.safety || []).every((gate) => gate.ok);
+  const policyMode = data.policy_mode || data.config?.policy_mode || "unmanaged";
   $("#connectionDot").className = `status-dot ${safe ? "dot-ok pulse-live" : "dot-warn"}`;
-  $("#connectionLabel").textContent = safe ? "Paper connection" : "Safety warning";
-  $("#navStatus").textContent = `${data.runtime?.status || "pending"} / ${data.strategy?.name || "unknown"}`;
+  $("#connectionLabel").textContent = policyMode === "active" ? (safe ? "Active paper policy" : "Safety warning") : "NO TRADE / observer";
+  $("#navStatus").textContent = `${policyMode} / ${data.runtime?.status || "pending"} / ${data.strategy?.name || "unknown"}`;
   $("#updatedAt").textContent = `Updated ${data.generated_at}. Strategy: ${data.strategy?.name || "unknown"}. Browser config is read-only.`;
   $("#bankrollLabel").textContent = `${fmtUsd(data.config?.paper_bankroll_usdc)} paper`;
 }

@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import hashlib
+
+import pytest
+
 from bot.strategy.calibration import (
     FEATURE_NAMES,
     ProbabilityModel,
     accuracy,
+    brier_score,
     build_features,
     fit_logistic,
     log_loss,
@@ -95,6 +100,100 @@ def test_walk_forward_reports_market_baseline():
     assert report["train_samples"] + report["test_samples"] == len(rows)
     assert report["market_log_loss"] > 0
     assert report["test_log_loss"] < report["market_log_loss"]  # separable => beats flat market prob
+    assert report["test_brier_score"] < report["market_brier_score"]
+
+
+def test_probability_model_v2_records_provenance(tmp_path):
+    model = _flat_model(0.0)
+    model.schema_version = 2
+    model.training_metadata = {
+        "data_start": "2026-01-01T00:00:00+00:00",
+        "data_end": "2026-01-02T00:00:00+00:00",
+        "distinct_markets": 40,
+        "dataset_sha256": "a" * 64,
+        "oos": {
+            "beats_market": True,
+            "test_markets": 30,
+            "test_log_loss": 0.50,
+            "market_log_loss": 0.60,
+            "test_brier_score": 0.18,
+            "market_brier_score": 0.22,
+        },
+    }
+    path = tmp_path / "model-v2.json"
+    model.save(path)
+
+    loaded = ProbabilityModel.load(path)
+
+    assert loaded is not None
+    assert loaded.is_trade_approved()
+    assert loaded.training_metadata["distinct_markets"] == 40
+
+
+def test_legacy_model_is_diagnostic_only():
+    model = _flat_model(0.0)
+    assert model.is_compatible()
+    assert model.is_trade_approved() is False
+
+
+def test_model_cannot_self_approve_with_only_a_boolean():
+    model = _flat_model(0.0)
+    model.schema_version = 2
+    model.training_metadata = {
+        "distinct_markets": 200,
+        "dataset_sha256": "a" * 64,
+        "oos": {"beats_market": True, "test_markets": 40},
+    }
+
+    assert model.is_trade_approved() is False
+
+
+def test_malformed_model_metadata_fails_closed():
+    model = _flat_model(0.0)
+    model.schema_version = 2
+    model.training_metadata = {
+        "data_start": "x",
+        "data_end": "y",
+        "distinct_markets": "many",
+        "dataset_sha256": "a" * 64,
+        "oos": {"beats_market": True, "test_markets": 30},
+    }
+
+    assert model.is_trade_approved() is False
+
+
+def test_active_policy_requires_exact_approved_model_hash(tmp_path, settings):
+    model = _flat_model(0.0)
+    model.schema_version = 2
+    model.training_metadata = {
+        "data_start": "2026-01-01T00:00:00+00:00",
+        "data_end": "2026-01-02T00:00:00+00:00",
+        "distinct_markets": 200,
+        "dataset_sha256": "a" * 64,
+        "oos": {
+            "beats_market": True,
+            "test_markets": 40,
+            "test_log_loss": 0.50,
+            "market_log_loss": 0.60,
+            "test_brier_score": 0.18,
+            "market_brier_score": 0.22,
+        },
+    }
+    path = tmp_path / "approved.json"
+    model.save(path)
+    settings.probability_model_path = path
+    settings.require_approved_probability_model = True
+    settings.policy_mode = "active"
+    settings.policy_model_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+
+    assert MomentumBookImbalanceStrategy(settings)._model_is_trade_approved() is True
+
+    settings.policy_model_sha256 = "f" * 64
+    assert MomentumBookImbalanceStrategy(settings)._model_is_trade_approved() is False
+
+
+def test_brier_score_matches_mean_squared_probability_error():
+    assert brier_score([0.8, 0.3], [1, 0]) == pytest.approx(0.065)
 
 
 def test_strategy_uses_calibrated_model_when_present(tmp_path, settings, context):
@@ -156,3 +255,23 @@ def test_strategy_falls_back_to_heuristic_without_model(settings, context):
     signal = MomentumBookImbalanceStrategy(settings).evaluate(context)
 
     assert signal.metadata["probability_source"] == "heuristic"
+
+
+def test_observer_strategy_collects_candidate_without_entry(settings, context):
+    settings.enable_experimental_strategy = False
+    settings.policy_mode = "observe"
+    context.up_book.asks[0].price = 0.40
+    context.up_book.bids[0].price = 0.39
+    context.up_book.asks[0].size = 1000
+    context.up_book.bids[0].size = 2000
+    context.btc.current_price = 102
+    context.btc.market_open_price = 100
+    context.btc.momentum_15s = 0.003
+    context.btc.momentum_60s = 0.004
+
+    signal = MomentumBookImbalanceStrategy(settings, observer_only=True).evaluate(context)
+
+    assert signal.action == SignalAction.HOLD
+    assert signal.reason == "no active validated paper policy"
+    assert signal.metadata["observer_candidate_action"] == "BUY_UP"
+    assert signal.metadata["features"]
