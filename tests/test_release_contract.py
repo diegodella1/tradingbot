@@ -24,7 +24,8 @@ def test_deploy_requires_lock_and_rejects_mutable_releases() -> None:
     assert '--python "$ROOT_DIR/.venv/bin/python"' in deploy
     assert "--extra dev" in deploy
     assert "-p no:cacheprovider" in deploy
-    assert 'find "$RELEASE_DIR" -perm /222' in deploy
+    assert 'find "$target" ! -type l -perm /222' in deploy
+    assert 'verify_release_read_only "$RELEASE_DIR"' in deploy
     assert "verify_release_source" in deploy
     assert 'chmod -R a-w "$BUILD_DIR"' in deploy
     assert 'if [ "$BUILD_ONLY" = "true" ]' in deploy

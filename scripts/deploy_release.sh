@@ -58,17 +58,23 @@ verify_release_source() {
   VERIFY_DIR=""
 }
 
+verify_release_read_only() {
+  local target="$1"
+  local writable_path
+  writable_path="$(find "$target" ! -type l -perm /222 -print -quit)"
+  if [ -n "$writable_path" ]; then
+    echo "ERROR release_is_writable=true release=$target path=$writable_path"
+    return 1
+  fi
+}
+
 mkdir -p "$DEPLOY_ROOT/releases" "$DEPLOY_ROOT/release-env"
 if [ -d "$RELEASE_DIR" ]; then
   if [ ! -f "$RELEASE_DIR/.release.json" ] || ! grep -Fq "\"commit\":\"$SHA\"" "$RELEASE_DIR/.release.json"; then
     echo "ERROR release_manifest_invalid=true release=$RELEASE_DIR"
     exit 1
   fi
-  WRITABLE_RELEASE_PATH="$(find "$RELEASE_DIR" -perm /222 -print -quit)"
-  if [ -n "$WRITABLE_RELEASE_PATH" ]; then
-    echo "ERROR release_is_writable=true release=$RELEASE_DIR"
-    exit 1
-  fi
+  verify_release_read_only "$RELEASE_DIR"
   verify_release_source "$RELEASE_DIR"
 else
   BUILD_DIR="$(mktemp -d "$DEPLOY_ROOT/releases/.build-$SHA.XXXXXX")"
@@ -94,6 +100,7 @@ else
   chmod -R a-w "$BUILD_DIR"
   mv "$BUILD_DIR" "$RELEASE_DIR"
   BUILD_DIR=""
+  verify_release_read_only "$RELEASE_DIR"
   verify_release_source "$RELEASE_DIR"
 fi
 
