@@ -953,3 +953,13 @@ input:focus-visible {
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 2;
 }
+
+.runtime-status-strip { display:flex; align-items:center; gap:12px; margin:0 0 24px; padding:12px 16px; border:1px solid var(--outline-variant,rgba(140,144,162,.35)); border-left:3px solid var(--btc-blue,#00a3ff); border-radius:10px; background:rgba(19,27,46,.78); }
+.runtime-status-strip strong { display:block; color:var(--on-surface,#dae2fd); font-size:.82rem; letter-spacing:.04em; text-transform:uppercase; }
+.runtime-status-strip p { margin:3px 0 0; color:var(--on-surface-variant,#c2c6d9); font-size:.78rem; }
+.runtime-status-strip code { margin-left:auto; color:var(--outline,#8c90a2); font:500 .7rem/1.2 'JetBrains Mono',monospace; white-space:nowrap; }
+.runtime-status-mark { width:9px; height:9px; flex:0 0 auto; border-radius:999px; background:#00a3ff; box-shadow:0 0 0 4px rgba(0,163,255,.12); }
+.runtime-status-observe { border-left-color:#f59e0b; } .runtime-status-observe .runtime-status-mark { background:#f59e0b; box-shadow:0 0 0 4px rgba(245,158,11,.14); }
+.runtime-status-active { border-left-color:#34d399; } .runtime-status-active .runtime-status-mark { background:#34d399; box-shadow:0 0 0 4px rgba(52,211,153,.14); }
+.runtime-status-warn { border-left-color:#fb7185; } .runtime-status-warn .runtime-status-mark { background:#fb7185; box-shadow:0 0 0 4px rgba(251,113,133,.14); }
+@media (max-width:640px) { .runtime-status-strip { align-items:flex-start; } .runtime-status-strip code { display:none; } }
