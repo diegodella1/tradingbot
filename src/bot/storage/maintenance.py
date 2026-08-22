@@ -43,11 +43,14 @@ def compact_database(source: Path, output: Path, backup_directory: Path, retenti
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         before = _telemetry_counts(connection)
+        # Remove expired high-volume telemetry before window-function deduplication.
+        # On the production SD card, doing this in the opposite order forced SQLite
+        # to sort the entire 1.8 GB history and dominated the maintenance window.
+        pruned = prune_old_data(connection, retention_days)
         with connection:
             _roll_up_legacy_rejections(connection)
             for table, (predicate, partition) in DEDUPLICATION_RULES.items():
                 _deduplicate(connection, table, predicate, partition)
-        pruned = prune_old_data(connection, retention_days)
         connection.execute("ANALYZE")
         connection.execute("PRAGMA optimize")
         connection.execute("VACUUM")

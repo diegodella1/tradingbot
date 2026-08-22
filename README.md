@@ -293,7 +293,7 @@ switches `current` plus `current.env` atomically, restarts both services, and
 verifies `/api/healthz` against the expected commit. A failed health check
 restores the prior release and runtime environment.
 
-Database compaction is offline and rollback-safe. It checks integrity, creates a checksummed backup, aggregates repeated telemetry, compacts a copied database, swaps it only after validation, then checks service health:
+Database compaction is offline and rollback-safe. It checks integrity, creates a checksummed backup, prunes expired telemetry before deduplication, compacts a copied database, swaps it only after validation, then checks service health:
 
 ```bash
 ./scripts/maintenance_compact.sh
